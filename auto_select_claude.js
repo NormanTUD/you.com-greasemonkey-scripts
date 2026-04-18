@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         You.com Auto-Select Claude Opus 4.6
 // @namespace    http://tampermonkey.net/
-// @version      2.0
-// @description  Automatically selects Claude Opus 4.6 on You.com
+// @version      2.1
+// @description  Automatically selects Claude Opus 4.6 on You.com and focuses the text input
 // @match        https://you.com/*
 // @match        https://www.you.com/*
 // @grant        none
@@ -14,6 +14,18 @@
 
     let done = false;
 
+    function focusTextarea() {
+        setTimeout(() => {
+            const textarea = document.getElementById('search-input-textarea');
+            if (textarea) {
+                textarea.focus();
+                console.log('[Userscript] ✅ Textarea focused!');
+            } else {
+                console.log('[Userscript] ❌ Textarea not found.');
+            }
+        }, 300);
+    }
+
     function trySelect() {
         if (done) return;
 
@@ -21,11 +33,11 @@
         const activeSpan = document.querySelector('button[data-state="closed"] span.n6zur96, button[data-state="closed"] span._82ityr0');
         if (activeSpan && activeSpan.textContent.includes('Claude')) {
             done = true;
+            focusTextarea();
             return;
         }
 
-        // Step 2: Find and click the agent/mode selector button (first button in the toolbar area)
-        // This is the "Auto" / "Express" / model name button
+        // Step 2: Find and click the agent/mode selector button
         const modeButton = document.querySelector('#ChatQueryBar button[type="button"]');
         if (!modeButton) return;
 
@@ -35,21 +47,20 @@
         setTimeout(() => {
             if (done) return;
 
-            // Look through all buttons and list items in the tooltip/dropdown
             const dropdown = document.querySelector('[role="tooltip"]');
             if (!dropdown) {
-                // Try again — dropdown may not have appeared
-                document.body.click(); // close anything
+                document.body.click();
                 return;
             }
 
-            // Find Claude in the recents list
             const listButtons = dropdown.querySelectorAll('li button, button[role="option"]');
             for (const btn of listButtons) {
                 if (btn.textContent.trim().includes('Claude Opus 4.6')) {
                     btn.click();
                     done = true;
                     console.log('[Userscript] ✅ Claude Opus 4.6 selected!');
+                    // Focus the textarea after selecting Claude
+                    focusTextarea();
                     return;
                 }
             }
