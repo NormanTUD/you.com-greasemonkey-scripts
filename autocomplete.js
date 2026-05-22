@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         You.com Auto-Coder v5
+// @name         You.com Auto-Coder v6
 // @namespace    http://tampermonkey.net/
-// @version      5.0
-// @description  Single-button auto-continue, smart merge with placeholders, model-driven JS testing
+// @version      6.0
+// @description  Fully automatic code generation with visual feedback, placeholder system
 // @match        https://you.com/*
 // @grant        none
 // ==/UserScript==
@@ -10,810 +10,833 @@
 (function () {
     'use strict';
 
-    /* ══════════════════════════════════════════════════════
-       CONSTANTS
-    ══════════════════════════════════════════════════════ */
-    const ATTR = 'data-acv5';
-    const FINISH_SIGNAL = 'I REALLY NOW FINISHED';
-    const TEST_START = '>>>TESTCODE STARTS<<<';
-    const TEST_END = '>>>TESTCODE ENDS<<<';
-    const SUBMIT_DELAY = 30000;
-    const MAX_RETRIES = 15;
-    const POLL_INTERVAL = 3000;
-    const DOM_SETTLE_MS = 2500;
+    var BT = String.fromCharCode(96);
+    var FENCE = BT + BT + BT;
 
-    /* ══════════════════════════════════════════════════════
-       STATE
-    ══════════════════════════════════════════════════════ */
-    let running = false;
-    let mergedParts = [];
-    let retryCount = 0;
-    let lastTurnCount = 0;
-    let pollTimer = null;
+    var FINISH = '>>>FINISHED<<<';
+    var CODE_START = '>>>CODE STARTS<<<';
+    var CODE_END = '>>>CODE ENDS<<<';
+    var TEST_START = '>>>TESTCODE STARTS<<<';
+    var TEST_END = '>>>TESTCODE ENDS<<<';
+    var BACKTICK_ESC = '>>>BACKTICK<<<';
+    var DELAY_MS = 30000;
+    var MAX_RETRIES = 20;
+    var POLL_MS = 2500;
+    var SETTLE_MS = 2000;
+    var ATTR = 'data-acv6';
 
-    /* ══════════════════════════════════════════════════════
-       STYLES
-    ══════════════════════════════════════════════════════ */
+    var running = false;
+    var parts = {};
+    var outline = '';
+    var currentPlaceholder = null;
+    var retries = 0;
+    var lastTurns = 0;
+    var pollId = null;
+    var timerId = null;
+    var logEntries = [];
+
     function injectStyles() {
-        const s = document.createElement('style');
-        s.textContent = getStyleText();
-        document.head.appendChild(s);
+        var el = document.createElement('style');
+        el.textContent = [
+            '.acv6-hidden{position:absolute!important;width:1px!important;height:1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;border:0!important;padding:0!important;margin:-1px!important;}',
+            '#acv6-bar{position:fixed;bottom:0;left:0;right:0;z-index:9999999;display:flex;align-items:stretch;background:rgba(10,8,20,.98);border-top:1px solid rgba(139,92,246,.3);backdrop-filter:blur(16px);}',
+            '#acv6-input{flex:1;min-height:50px;max-height:200px;resize:none;padding:14px 16px;border:none;outline:none;background:transparent;color:#e2e8f0;font:13px/1.5 "SF Mono","Fira Code","Consolas",monospace;}',
+            '#acv6-input::placeholder{color:rgba(255,255,255,.2);}',
+            '#acv6-go{width:60px;border:none;cursor:pointer;background:linear-gradient(135deg,#7c3aed,#6366f1);color:#fff;font:700 20px/1 sans-serif;transition:all .2s;}',
+            '#acv6-go:hover{opacity:.85;}',
+            '#acv6-go.on{background:linear-gradient(135deg,#dc2626,#ef4444);animation:acv6-p 1s infinite;}',
+            '@keyframes acv6-p{0%,100%{opacity:1}50%{opacity:.5}}',
+            '#acv6-log{position:fixed;top:10px;right:10px;width:340px;max-height:50vh;z-index:9999998;overflow-y:auto;background:rgba(10,8,20,.94);border:1px solid rgba(139,92,246,.25);border-radius:12px;padding:10px;font:11px/1.5 "SF Mono",monospace;color:#a5b4fc;display:none;flex-direction:column;gap:2px;box-shadow:0 12px 40px rgba(0,0,0,.6);backdrop-filter:blur(12px);}',
+            '#acv6-log.visible{display:flex;}',
+            '.acv6-log-entry{padding:3px 6px;border-radius:4px;word-break:break-word;}',
+            '.acv6-log-entry.info{color:#6ee7b7;}',
+            '.acv6-log-entry.warn{color:#fbbf24;background:rgba(251,191,36,.05);}',
+            '.acv6-log-entry.error{color:#fca5a5;background:rgba(239,68,68,.05);}',
+            '.acv6-log-entry.success{color:#34d399;background:rgba(52,211,153,.05);}',
+            '#acv6-log-toggle{position:fixed;top:10px;right:360px;z-index:9999998;width:32px;height:32px;border-radius:8px;border:none;cursor:pointer;background:rgba(139,92,246,.2);color:#a5b4fc;font:14px/1 sans-serif;transition:all .2s;}',
+            '#acv6-log-toggle:hover{background:rgba(139,92,246,.4);}',
+            '#acv6-timer{position:fixed;bottom:58px;right:16px;z-index:9999998;display:none;align-items:center;gap:10px;padding:10px 16px;background:rgba(10,8,20,.96);border:1px solid rgba(139,92,246,.3);border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.5);}',
+            '#acv6-timer.visible{display:flex;}',
+            '.acv6-ring{width:40px;height:40px;transform:rotate(-90deg);}',
+            '.acv6-ring-bg{fill:none;stroke:rgba(139,92,246,.12);stroke-width:4;}',
+            '.acv6-ring-fg{fill:none;stroke:#7c3aed;stroke-width:4;stroke-linecap:round;stroke-dasharray:100.53;stroke-dashoffset:0;transition:stroke-dashoffset 1s linear;}',
+            '#acv6-timer-sec{font:700 18px/1 "SF Mono",monospace;color:#c4b5fd;min-width:28px;text-align:center;}',
+            '#acv6-timer-lbl{font:11px/1.3 sans-serif;color:rgba(255,255,255,.4);}',
+            '#acv6-progress{position:fixed;bottom:54px;left:0;right:0;height:3px;z-index:9999997;background:rgba(139,92,246,.1);}',
+            '#acv6-progress-fill{height:100%;width:0%;background:linear-gradient(90deg,#7c3aed,#a855f7,#ec4899);transition:width .5s ease;}',
+            '#acv6-panel{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:75vw;max-width:960px;max-height:82vh;z-index:99999999;background:rgba(12,10,24,.99);border:1px solid rgba(139,92,246,.35);border-radius:14px;display:none;flex-direction:column;box-shadow:0 30px 80px rgba(0,0,0,.7);overflow:hidden;}',
+            '#acv6-panel.visible{display:flex;}',
+            '#acv6-panel-head{padding:12px 16px;background:rgba(139,92,246,.06);border-bottom:1px solid rgba(139,92,246,.2);display:flex;justify-content:space-between;align-items:center;font:600 13px/1 sans-serif;color:#c4b5fd;}',
+            '#acv6-panel-body{flex:1;overflow:auto;padding:14px;font:12px/1.6 "SF Mono",monospace;color:#e2e8f0;white-space:pre-wrap;tab-size:2;}',
+            '#acv6-panel-foot{padding:10px 14px;border-top:1px solid rgba(139,92,246,.2);display:flex;gap:8px;}',
+            '.acv6-btn{padding:6px 14px;border:none;border-radius:7px;cursor:pointer;font:600 11px/1.3 sans-serif;transition:all .15s;}',
+            '.acv6-btn:hover{transform:translateY(-1px);}',
+            '.acv6-btn--cp{background:rgba(56,189,248,.12);color:#93c5fd;}',
+            '.acv6-btn--dl{background:rgba(251,146,60,.12);color:#fdba74;}',
+            '.acv6-btn--cl{background:rgba(239,68,68,.12);color:#fca5a5;}',
+            '#acv6-parts{position:fixed;top:10px;left:10px;z-index:9999998;background:rgba(10,8,20,.94);border:1px solid rgba(139,92,246,.2);border-radius:10px;padding:8px 12px;font:11px/1.5 "SF Mono",monospace;color:#a5b4fc;max-width:280px;display:none;}',
+            '#acv6-parts.visible{display:block;}',
+            '.acv6-part-item{padding:2px 0;display:flex;align-items:center;gap:6px;}',
+            '.acv6-part-dot{width:8px;height:8px;border-radius:50%;}',
+            '.acv6-part-dot.done{background:#34d399;}',
+            '.acv6-part-dot.pending{background:rgba(255,255,255,.15);}',
+            '.acv6-part-dot.active{background:#fbbf24;animation:acv6-p 1s infinite;}'
+        ].join('\n');
+        document.head.appendChild(el);
     }
 
-    function getStyleText() {
-        return `
-            /* Hide original input area visually */
-            .ch-hidden-original {
-                position: absolute !important;
-                width: 1px !important; height: 1px !important;
-                overflow: hidden !important;
-                clip: rect(0,0,0,0) !important;
-                white-space: nowrap !important;
-                border: 0 !important;
-                padding: 0 !important;
-                margin: -1px !important;
-            }
-
-            /* Our input bar */
-            #acv5-bar {
-                position: fixed; bottom: 0; left: 0; right: 0;
-                z-index: 9999999;
-                display: flex; align-items: stretch; gap: 0;
-                background: rgba(12,10,24,.97);
-                border-top: 1px solid rgba(139,92,246,.25);
-                backdrop-filter: blur(16px);
-                padding: 0;
-            }
-            #acv5-input {
-                flex: 1;
-                min-height: 52px; max-height: 220px;
-                resize: none;
-                padding: 14px 18px;
-                border: none; outline: none;
-                background: transparent;
-                color: #e2e8f0;
-                font: 14px/1.5 'SF Mono','Fira Code','Consolas',monospace;
-            }
-            #acv5-input::placeholder { color: rgba(255,255,255,.25); }
-            #acv5-go {
-                width: 64px; min-height: 52px;
-                border: none; cursor: pointer;
-                background: linear-gradient(135deg,#7c3aed,#6366f1);
-                color: #fff; font: 700 18px/1 sans-serif;
-                transition: opacity .2s;
-            }
-            #acv5-go:hover { opacity: .85; }
-            #acv5-go.running {
-                background: linear-gradient(135deg,#dc2626,#ef4444);
-                animation: acv5-pulse 1.2s infinite;
-            }
-            @keyframes acv5-pulse {
-                0%,100% { opacity:1; } 50% { opacity:.6; }
-            }
-            #acv5-status {
-                position: fixed; bottom: 56px; left: 0; right: 0;
-                padding: 4px 16px;
-                font: 11px/1.4 'SF Mono',monospace;
-                color: rgba(255,255,255,.5);
-                background: rgba(12,10,24,.85);
-                border-top: 1px solid rgba(139,92,246,.12);
-                z-index: 9999998;
-                pointer-events: none;
-                transition: color .2s;
-            }
-            #acv5-status.ok { color: #6ee7b7; }
-            #acv5-status.err { color: #fca5a5; }
-            #acv5-status.warn { color: #fbbf24; }
-
-            /* Merged panel */
-            #acv5-panel {
-                position: fixed; top: 50%; left: 50%;
-                transform: translate(-50%,-50%);
-                width: 70vw; max-width: 900px; max-height: 80vh;
-                z-index: 99999999;
-                background: rgba(15,12,30,.98);
-                border: 1px solid rgba(139,92,246,.35);
-                border-radius: 14px;
-                display: none; flex-direction: column;
-                box-shadow: 0 30px 80px rgba(0,0,0,.7);
-                overflow: hidden;
-            }
-            #acv5-panel.visible { display: flex; }
-            #acv5-panel-head {
-                padding: 12px 16px;
-                background: rgba(139,92,246,.08);
-                border-bottom: 1px solid rgba(139,92,246,.2);
-                display: flex; justify-content: space-between; align-items: center;
-                font: 600 13px/1 -apple-system,sans-serif; color: #c4b5fd;
-            }
-            #acv5-panel-body {
-                flex: 1; overflow: auto; padding: 14px;
-                font: 12px/1.6 'SF Mono','Fira Code',monospace;
-                color: #e2e8f0; white-space: pre-wrap; tab-size: 2;
-            }
-            #acv5-panel-foot {
-                padding: 10px 14px;
-                border-top: 1px solid rgba(139,92,246,.2);
-                display: flex; gap: 8px;
-            }
-            .acv5-pbtn {
-                padding: 6px 14px; border: none; border-radius: 7px;
-                cursor: pointer; font: 600 11px/1.3 -apple-system,sans-serif;
-                transition: all .15s;
-            }
-            .acv5-pbtn:hover { transform: translateY(-1px); }
-            .acv5-pbtn--copy { background: rgba(56,189,248,.15); color: #93c5fd; }
-            .acv5-pbtn--dl { background: rgba(251,146,60,.15); color: #fdba74; }
-            .acv5-pbtn--close { background: rgba(239,68,68,.15); color: #fca5a5; }
-
-            /* Code block mini-toolbar (minimal) */
-            .acv5-minitb {
-                position: absolute; top: 4px; right: 4px;
-                display: flex; gap: 3px; opacity: 0;
-                transition: opacity .2s;
-                z-index: 999;
-            }
-            figure:hover .acv5-minitb { opacity: 1; }
-            .acv5-mbtn {
-                padding: 3px 8px; border: none; border-radius: 5px;
-                cursor: pointer; font: 600 10px/1 sans-serif;
-                background: rgba(255,255,255,.08); color: rgba(255,255,255,.6);
-                transition: all .15s;
-            }
-            .acv5-mbtn:hover { background: rgba(139,92,246,.3); color: #fff; }
-        `;
+    function log(msg, type) {
+        type = type || 'info';
+        var ts = new Date().toLocaleTimeString();
+        var full = '[' + ts + '] ' + msg;
+        var colors = { info: '#6ee7b7', warn: '#fbbf24', error: '#fca5a5', success: '#34d399' };
+        console.log('%c[ACv6] ' + msg, 'color:' + (colors[type] || colors.info) + ';font-weight:bold');
+        logEntries.push({ msg: full, type: type });
+        renderLog();
     }
 
-    /* ══════════════════════════════════════════════════════
-       LOGGING
-    ══════════════════════════════════════════════════════ */
-    function log(msg, type = 'info') {
-        const pre = '[ACv5]';
-        const c = { info:'#6ee7b7', warn:'#fbbf24', error:'#fca5a5', success:'#34d399' };
-        console.log(`%c${pre} ${msg}`, `color:${c[type]||c.info};font-weight:bold`);
-        setStatus(msg, type);
-    }
-
-    function setStatus(msg, type = 'info') {
-        const el = document.getElementById('acv5-status');
+    function renderLog() {
+        var el = document.getElementById('acv6-log');
         if (!el) return;
-        el.textContent = `[${timeStr()}] ${msg}`;
-        el.className = type === 'error' ? 'err' : type === 'warn' ? 'warn' : 'ok';
+        var last30 = logEntries.slice(-30);
+        el.innerHTML = last30.map(function (e) {
+            return '<div class="acv6-log-entry ' + e.type + '">' + escHtml(e.msg) + '</div>';
+        }).join('');
+        el.scrollTop = el.scrollHeight;
     }
 
-    function timeStr() {
-        return new Date().toLocaleTimeString();
+    function escHtml(s) {
+        return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
 
-    /* ══════════════════════════════════════════════════════
-       DOM QUERIES
-    ══════════════════════════════════════════════════════ */
-    function getOriginalTextarea() {
+    function showLog() {
+        var el = document.getElementById('acv6-log');
+        if (el) el.classList.add('visible');
+    }
+
+    function showTimer(ms, label) {
+        var el = document.getElementById('acv6-timer');
+        var sec = document.getElementById('acv6-timer-sec');
+        var lbl = document.getElementById('acv6-timer-lbl');
+        var ring = document.getElementById('acv6-ring-fg');
+        if (!el) return;
+        var circ = 2 * Math.PI * 16;
+        ring.style.strokeDasharray = circ;
+        ring.style.strokeDashoffset = '0';
+        lbl.textContent = label || 'waiting...';
+        el.classList.add('visible');
+        var total = Math.ceil(ms / 1000);
+        var rem = total;
+        sec.textContent = rem;
+        clearTimerInterval();
+        timerId = setInterval(function () {
+            rem--;
+            if (rem <= 0) { hideTimer(); return; }
+            sec.textContent = rem;
+            var pct = 1 - (rem / total);
+            ring.style.strokeDashoffset = circ * pct;
+        }, 1000);
+    }
+
+    function hideTimer() {
+        clearTimerInterval();
+        var el = document.getElementById('acv6-timer');
+        if (el) el.classList.remove('visible');
+    }
+
+    function clearTimerInterval() {
+        if (timerId) { clearInterval(timerId); timerId = null; }
+    }
+
+    function setProgress(pct) {
+        var el = document.getElementById('acv6-progress-fill');
+        if (el) el.style.width = Math.min(100, Math.max(0, pct)) + '%';
+    }
+
+    function calcProgress() {
+        var keys = Object.keys(parts).filter(function (k) { return k !== '__TEST__'; });
+        if (keys.length === 0) return 0;
+        var filled = keys.filter(function (k) { return parts[k] !== null; }).length;
+        return (filled / keys.length) * 100;
+    }
+
+    function renderParts() {
+        var el = document.getElementById('acv6-parts');
+        if (!el) return;
+        var keys = Object.keys(parts).filter(function (k) { return k !== '__TEST__'; });
+        if (keys.length === 0) { el.classList.remove('visible'); return; }
+        el.classList.add('visible');
+        var html = '<div style="margin-bottom:4px;font-weight:700;color:#c4b5fd;">Parts:</div>';
+        html += keys.map(function (k) {
+            var status = parts[k] !== null ? 'done' : (k === currentPlaceholder ? 'active' : 'pending');
+            var lines = parts[k] ? ' (' + parts[k].split('\n').length + 'ln)' : '';
+            return '<div class="acv6-part-item"><span class="acv6-part-dot ' + status + '"></span>' + escHtml(k) + lines + '</div>';
+        }).join('');
+        el.innerHTML = html;
+    }
+
+    function getTA() {
         return document.querySelector('#search-input-textarea');
     }
 
-    function getOriginalForm() {
-        const ta = getOriginalTextarea();
-        return ta ? ta.closest('form') : null;
-    }
-
-    function getTurnCount() {
+    function getTurns() {
         return document.querySelectorAll('[data-testid^="youchat-answer-turn-"]').length;
     }
 
-    function getLatestTurnEl() {
-        const all = document.querySelectorAll('[data-testid^="youchat-answer-turn-"]');
-        return all.length ? all[all.length - 1] : null;
+    function getLastTurnText() {
+        var all = document.querySelectorAll('[data-testid^="youchat-answer-turn-"]');
+        return all.length ? (all[all.length - 1].textContent || '') : '';
     }
 
-    function getLatestText() {
-        const el = getLatestTurnEl();
-        return el ? el.textContent || '' : '';
+    function stillGenerating() {
+        var uf = document.querySelectorAll('[data-testid^="step-"][data-finished="false"]');
+        return uf.length > 0;
     }
 
-    function getAllCodeBlocksInTurn(turnEl) {
-        if (!turnEl) return [];
-        return [...turnEl.querySelectorAll('figure code')];
-    }
-
-    function getLatestCodeBlocks() {
-        return getAllCodeBlocksInTurn(getLatestTurnEl());
-    }
-
-    function isStillGenerating() {
-        const unfinished = document.querySelectorAll('[data-testid^="step-"][data-finished="false"]');
-        if (unfinished.length > 0) return true;
-        const sub = document.querySelector('[data-testid="search-input-send-button"]');
-        if (sub && sub.disabled) return true;
-        return false;
-    }
-
-    function hasFinishSignal() {
-        const spans = document.querySelectorAll('[data-testid="youchat-text"]');
-        for (const s of spans) {
-            if (s.textContent.includes(FINISH_SIGNAL)) return true;
-        }
-        return false;
-    }
-
-    /* ══════════════════════════════════════════════════════
-       INPUT / SUBMIT
-    ══════════════════════════════════════════════════════ */
-    function submitText(text) {
-        const ta = getOriginalTextarea();
+    function submitPrompt(text) {
+        var ta = getTA();
         if (!ta) { log('Textarea not found!', 'error'); return false; }
-        setNativeValue(ta, text);
-        fireInputEvents(ta);
-        setTimeout(() => clickSubmit(ta), 350);
+        var setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+        setter.call(ta, text);
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+        ta.dispatchEvent(new Event('change', { bubbles: true }));
+        setTimeout(function () {
+            var form = ta.closest('form');
+            if (!form) return;
+            var btn = form.querySelector('button[type="submit"],[data-testid="search-input-send-button"]');
+            if (btn) { btn.disabled = false; btn.click(); }
+        }, 400);
         return true;
     }
 
-    function setNativeValue(el, val) {
-        const set = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
-        set.call(el, val);
-    }
-
-    function fireInputEvents(el) {
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-    }
-
-    function clickSubmit(ta) {
-        const form = ta.closest('form');
-        if (!form) return;
-        const btn = form.querySelector('button[type="submit"], [data-testid="search-input-send-button"]');
-        if (btn) { btn.disabled = false; btn.click(); }
-        else form.dispatchEvent(new Event('submit', { bubbles: true }));
-    }
-
-    /* ══════════════════════════════════════════════════════
-       HIDE ORIGINAL TEXTAREA
-    ══════════════════════════════════════════════════════ */
     function hideOriginalInput() {
-        const form = getOriginalForm();
-        if (!form) return;
-        const wrapper = form.closest('[class*="input"]') || form.parentElement;
-        if (wrapper && !wrapper.classList.contains('ch-hidden-original')) {
-            wrapper.classList.add('ch-hidden-original');
-            log('Original input hidden', 'info');
+        var ta = getTA();
+        if (!ta) return;
+        var wrapper = ta.closest('form');
+        if (wrapper) wrapper = wrapper.parentElement;
+        if (wrapper && !wrapper.classList.contains('acv6-hidden')) {
+            wrapper.classList.add('acv6-hidden');
         }
     }
 
-    function showOriginalInput() {
-        const hidden = document.querySelector('.ch-hidden-original');
-        if (hidden) hidden.classList.remove('ch-hidden-original');
+    function buildInitialPrompt(userText) {
+        var lines = [];
+        lines.push(userText);
+        lines.push('');
+        lines.push('================================================================');
+        lines.push('CRITICAL INSTRUCTIONS - THE ENTIRE PROJECT DEPENDS ON THESE');
+        lines.push('================================================================');
+        lines.push('');
+        lines.push('STEP 1: OUTLINE FIRST');
+        lines.push('- Output a structured outline with labeled placeholders.');
+        lines.push('- Placeholder format: >>>$PLACEHOLDER_NAME<<<');
+        lines.push('- Examples: >>>$JS_MAIN<<<, >>>$HTML_TEMPLATE<<<, >>>$CSS_STYLES<<<');
+        lines.push('- The outline shows the full file structure with placeholders.');
+        lines.push('');
+        lines.push('STEP 2: FILL EACH PLACEHOLDER');
+        lines.push('- Fill them ONE BY ONE.');
+        lines.push('- Before each code block write on its own line: ' + CODE_START + ' PLACEHOLDER_NAME');
+        lines.push('- After each code block write on its own line: ' + CODE_END);
+        lines.push('- ALL functions must be ~10 lines max.');
+        lines.push('');
+        lines.push('STEP 3: BACKTICK ESCAPING');
+        lines.push('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!');
+        lines.push('THIS IS EXTREMELY CRITICAL. DO NOT SKIP THIS.');
+        lines.push('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!');
+        lines.push('- If your code contains backtick characters (template literals etc),');
+        lines.push('  replace EVERY backtick inside code with: ' + BACKTICK_ESC);
+        lines.push('- I will automatically convert them back.');
+        lines.push('- DO NOT use real backtick characters inside code. NEVER. EVER.');
+        lines.push('- This prevents breaking out of code fences.');
+        lines.push('');
+        lines.push('STEP 4: TESTING (JS/TS ONLY)');
+        lines.push('- If the code is JavaScript or TypeScript, include tests:');
+        lines.push('  ' + TEST_START);
+        lines.push('  // your test assertions');
+        lines.push('  ' + TEST_END);
+        lines.push('- If NOT JS/TS, do NOT include test markers.');
+        lines.push('');
+        lines.push('STEP 5: FINISH SIGNAL');
+        lines.push('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!');
+        lines.push('THIS IS THE SINGLE MOST IMPORTANT RULE OF ALL.');
+        lines.push('WITHOUT THIS, NOTHING WORKS. THE AUTOMATION BREAKS.');
+        lines.push('I CANNOT STRESS THIS ENOUGH.');
+        lines.push('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!');
+        lines.push('- When you are COMPLETELY done with ALL placeholders:');
+        lines.push('- Write this EXACT text on its own line: ' + FINISH);
+        lines.push('- If you do NOT write ' + FINISH + ', I will ask you to continue.');
+        lines.push('- NEVER write ' + FINISH + ' until EVERY placeholder is filled.');
+        lines.push('- If your response is getting long, STOP EARLY. I will continue.');
+        lines.push('- But when truly 100% done: ' + FINISH);
+        lines.push('- ' + FINISH + ' ' + FINISH + ' ' + FINISH);
+        lines.push('- I repeat: ' + FINISH + ' is REQUIRED at the end.');
+        lines.push('');
+        lines.push('EXAMPLE OUTPUT:');
+        lines.push('');
+        lines.push('OUTLINE:');
+        lines.push(FENCE + 'html');
+        lines.push('<!DOCTYPE html>');
+        lines.push('<html><head><style>>>>$CSS_STYLES<<<</style></head>');
+        lines.push('<body><script>>>>$JS_MAIN<<<</script></body></html>');
+        lines.push(FENCE);
+        lines.push('');
+        lines.push(CODE_START + ' CSS_STYLES');
+        lines.push(FENCE + 'css');
+        lines.push('body { margin: 0; }');
+        lines.push(FENCE);
+        lines.push(CODE_END);
+        lines.push('');
+        lines.push(CODE_START + ' JS_MAIN');
+        lines.push(FENCE + 'javascript');
+        lines.push('function main() { console.log("hi"); }');
+        lines.push(FENCE);
+        lines.push(CODE_END);
+        lines.push('');
+        lines.push(FINISH);
+        lines.push('');
+        lines.push('================================================================');
+        lines.push('NOW BEGIN. Outline first, then fill, then ' + FINISH + '.');
+        lines.push('================================================================');
+        return lines.join('\n');
     }
 
-    /* ══════════════════════════════════════════════════════
-       PART LABELING & PLACEHOLDER SYSTEM
-    ══════════════════════════════════════════════════════ */
-    function detectPartLabel(codeEl) {
-        const lang = detectLang(codeEl);
-        const labels = { html:'HTML Part', css:'CSS Part', javascript:'JS Part', js:'JS Part',
-            typescript:'TS Part', python:'Python Part', json:'JSON Part', bash:'Shell Part' };
-        return labels[lang] || `${lang.toUpperCase()} Part`;
-    }
-
-    function detectLang(codeEl) {
-        for (const cls of codeEl.classList) {
-            const m = cls.match(/^(?:language-|lang-)(.+)/i);
-            if (m) return m[1].toLowerCase();
+    function buildContinuePrompt() {
+        var unfilled = Object.keys(parts).filter(function (k) {
+            return k !== '__TEST__' && parts[k] === null;
+        });
+        var lines = [];
+        lines.push('Continue where you left off.');
+        if (currentPlaceholder && parts[currentPlaceholder]) {
+            var tail = parts[currentPlaceholder].split('\n').slice(-8).join('\n');
+            lines.push('');
+            lines.push('Last lines of ' + currentPlaceholder + ':');
+            lines.push(FENCE);
+            lines.push(tail);
+            lines.push(FENCE);
         }
-        return 'text';
+        lines.push('');
+        lines.push('Remaining placeholders: ' + unfilled.join(', '));
+        lines.push('');
+        lines.push('REMEMBER:');
+        lines.push('- ' + CODE_START + ' NAME before each block');
+        lines.push('- ' + CODE_END + ' after each block');
+        lines.push('- Replace backticks with ' + BACKTICK_ESC);
+        lines.push('- When ALL done: ' + FINISH);
+        lines.push('');
+        lines.push('!!! ' + FINISH + ' IS ABSOLUTELY REQUIRED WHEN DONE !!!');
+        lines.push('!!! DO NOT FORGET ' + FINISH + ' !!!');
+        lines.push('!!! THE ENTIRE SYSTEM BREAKS WITHOUT ' + FINISH + ' !!!');
+        return lines.join('\n');
     }
 
-    function addPart(code, label, lang) {
-        mergedParts.push({ code: code.trim(), label, lang, id: mergedParts.length });
-        log(`Added part #${mergedParts.length}: "${label}" (${code.split('\n').length} lines)`, 'success');
+    function buildFixPrompt(errors, code) {
+        var lines = [];
+        lines.push('The code has bugs. Provide the COMPLETE fixed code.');
+        lines.push('');
+        lines.push(FENCE + 'javascript');
+        lines.push(code);
+        lines.push(FENCE);
+        lines.push('');
+        lines.push('Errors:');
+        errors.forEach(function (e, i) {
+            lines.push((i + 1) + '. [' + e.type + '] ' + e.message);
+        });
+        lines.push('');
+        lines.push('Use ' + CODE_START + ' and ' + CODE_END + ' markers.');
+        lines.push('Replace backticks with ' + BACKTICK_ESC);
+        lines.push('When done: ' + FINISH);
+        lines.push('!!! ' + FINISH + ' IS REQUIRED !!!');
+        return lines.join('\n');
     }
 
-    function buildFinalOutput() {
-        if (mergedParts.length === 0) return '';
-        if (mergedParts.length === 1) return mergedParts[0].code;
-        return assemblePlaceholders();
+    function parseResponse(text) {
+        parseOutline(text);
+        parseCodeBlocks(text);
+        parseTestCode(text);
     }
 
-    function assemblePlaceholders() {
-        const htmlParts = mergedParts.filter(p => p.lang === 'html');
-        const jsParts = mergedParts.filter(p => isJSLang(p.lang));
-        const cssParts = mergedParts.filter(p => p.lang === 'css');
-        const otherParts = mergedParts.filter(p => !['html','css'].includes(p.lang) && !isJSLang(p.lang));
-
-        // If there's an HTML part with placeholders, fill them
-        if (htmlParts.length > 0) {
-            return mergeHTMLWithParts(htmlParts, jsParts, cssParts, otherParts);
+    function parseOutline(text) {
+        if (outline) return;
+        var match = text.match(/OUTLINE:?[\s\S]*?(<!DOCTYPE|<html|<\w|\/\/|#|\{)/i);
+        if (!match) {
+            var phMatches = text.match(/>>>\$([A-Z0-9_]+)<<</g);
+            if (phMatches && phMatches.length >= 2) {
+                extractPlaceholders(text);
+            }
+            return;
         }
-        // Otherwise just concatenate labeled
-        return concatLabeled();
+        extractPlaceholders(text);
     }
 
-    function mergeHTMLWithParts(htmlParts, jsParts, cssParts, otherParts) {
-        let html = htmlParts.map(p => p.code).join('\n');
-
-        // Replace %%JS_PLACEHOLDER%% or similar
-        if (jsParts.length > 0) {
-            const jsCode = jsParts.map(p => p.code).join('\n\n');
-            html = html.replace(/%%JS[_ ]?PLACEHOLDER%%/gi, jsCode);
-            html = html.replace(/<script><\/script>/gi, `<script>\n${jsCode}\n</script>`);
+    function extractPlaceholders(text) {
+        var phs = [];
+        var re = />>>\$([A-Z0-9_]+)<<</g;
+        var m;
+        while ((m = re.exec(text)) !== null) {
+            if (phs.indexOf(m[1]) === -1) phs.push(m[1]);
         }
-        if (cssParts.length > 0) {
-            const cssCode = cssParts.map(p => p.code).join('\n\n');
-            html = html.replace(/%%CSS[_ ]?PLACEHOLDER%%/gi, cssCode);
-            html = html.replace(/<style><\/style>/gi, `<style>\n${cssCode}\n</style>`);
-        }
-        // Append others as comments
-        if (otherParts.length > 0) {
-            html += '\n\n' + otherParts.map(p => `<!-- ${p.label} -->\n${p.code}`).join('\n\n');
-        }
-        return html;
+        if (phs.length === 0) return;
+        phs.forEach(function (name) {
+            if (!parts.hasOwnProperty(name)) parts[name] = null;
+        });
+        outline = text.substring(0, text.indexOf(CODE_START) > 0 ? text.indexOf(CODE_START) : text.length);
+        log('Outline: ' + phs.length + ' placeholders found: ' + phs.join(', '), 'success');
+        renderParts();
     }
 
-    function concatLabeled() {
-        return mergedParts.map(p => {
-            return `// ═══ ${p.label} (Part ${p.id + 1}) ═══\n${p.code}`;
-        }).join('\n\n');
+    function parseCodeBlocks(text) {
+        var startTag = CODE_START;
+        var endTag = CODE_END;
+        var idx = 0;
+        while (true) {
+            var si = text.indexOf(startTag, idx);
+            if (si === -1) break;
+            var ei = text.indexOf(endTag, si);
+            if (ei === -1) {
+                handlePartialBlock(text, si);
+                break;
+            }
+            var block = text.substring(si + startTag.length, ei);
+            processBlock(block);
+            idx = ei + endTag.length;
+        }
+        setProgress(calcProgress());
+        renderParts();
     }
 
-    /* ══════════════════════════════════════════════════════
-       SMART OVERLAP MERGE (for continuation fragments)
-    ══════════════════════════════════════════════════════ */
-    function mergeOverlapping(existing, fragment) {
+    function handlePartialBlock(text, startIdx) {
+        var block = text.substring(startIdx + CODE_START.length);
+        var nameMatch = block.match(/^\s*([A-Z0-9_]+)/);
+        if (nameMatch) {
+            currentPlaceholder = nameMatch[1];
+            var code = extractCodeFromBlock(block);
+            if (code && parts.hasOwnProperty(currentPlaceholder)) {
+                parts[currentPlaceholder] = mergeOverlap(parts[currentPlaceholder], code);
+                log('Partial: ' + currentPlaceholder + ' (will continue)', 'warn');
+            }
+        }
+    }
+
+    function processBlock(block) {
+        var nameMatch = block.match(/^\s*([A-Z0-9_]+)/);
+        if (!nameMatch) return;
+        var name = nameMatch[1];
+        var code = extractCodeFromBlock(block);
+        if (!code) return;
+        code = unescBackticks(code);
+        if (!parts.hasOwnProperty(name)) parts[name] = null;
+        parts[name] = mergeOverlap(parts[name], code);
+        currentPlaceholder = name;
+        log('Filled: ' + name + ' (' + code.split('\n').length + ' lines)', 'success');
+    }
+
+    function extractCodeFromBlock(block) {
+        var lines = block.split('\n');
+        var inCode = false;
+        var codeLines = [];
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i];
+            if (!inCode && line.trim().indexOf(BT + BT + BT) === 0) {
+                inCode = true;
+                continue;
+            }
+            if (inCode && line.trim() === BT + BT + BT) {
+                inCode = false;
+                continue;
+            }
+            if (inCode) codeLines.push(line);
+        }
+        if (codeLines.length === 0) {
+            var filtered = lines.slice(1).filter(function (l) { return l.trim().length > 0; });
+            return filtered.join('\n');
+        }
+        return codeLines.join('\n');
+    }
+
+    function parseTestCode(text) {
+        var si = text.indexOf(TEST_START);
+        var ei = text.indexOf(TEST_END);
+        if (si === -1 || ei === -1) return;
+        var tc = text.substring(si + TEST_START.length, ei).trim();
+        parts['__TEST__'] = tc;
+        log('Test code extracted.', 'info');
+    }
+
+    function unescBackticks(code) {
+        return code.replace(/>>>BACKTICK<<</g, BT);
+    }
+
+    function mergeOverlap(existing, fragment) {
         if (!existing) return fragment;
         if (!fragment) return existing;
-        const overlap = findOverlapLines(existing, fragment);
+        var overlap = findOverlap(existing, fragment);
         if (overlap > 0) {
-            log(`Overlap: ${overlap} lines removed`, 'info');
-            const fragLines = fragment.split('\n');
-            return existing + '\n' + fragLines.slice(overlap).join('\n');
+            log('Overlap: ' + overlap + ' lines merged', 'info');
+            return existing + '\n' + fragment.split('\n').slice(overlap).join('\n');
         }
         return existing + '\n' + fragment;
     }
 
-    function findOverlapLines(a, b) {
-        const aLines = a.split('\n');
-        const bLines = b.split('\n');
-        const maxCheck = Math.min(aLines.length, bLines.length, 25);
-        let best = 0;
-        for (let n = 1; n <= maxCheck; n++) {
-            if (tailMatchesHead(aLines, bLines, n)) best = n;
+    function findOverlap(a, b) {
+        var aL = a.split('\n');
+        var bL = b.split('\n');
+        var max = Math.min(aL.length, bL.length, 20);
+        var best = 0;
+        for (var n = 1; n <= max; n++) {
+            var tail = aL.slice(-n).map(function (l) { return l.trim(); }).join('\n');
+            var head = bL.slice(0, n).map(function (l) { return l.trim(); }).join('\n');
+            if (tail === head) best = n;
         }
         return best;
     }
 
-    function tailMatchesHead(aLines, bLines, n) {
-        const tail = aLines.slice(-n).map(l => l.trim()).join('\n');
-        const head = bLines.slice(0, n).map(l => l.trim()).join('\n');
-        return tail === head;
+    function assemble() {
+        var keys = Object.keys(parts).filter(function (k) { return k !== '__TEST__'; });
+        if (keys.length === 0) return '';
+        if (!outline) return concatAll();
+        var result = outline;
+        keys.forEach(function (k) {
+            var ph = '>>>$' + k + '<<<';
+            if (parts[k]) {
+                result = result.split(ph).join(parts[k]);
+            }
+        });
+        result = cleanAssembly(result);
+        return result;
     }
 
-    /* ══════════════════════════════════════════════════════
-       JS TESTING (model-driven via markers)
-    ══════════════════════════════════════════════════════ */
-    function extractTestCode(text) {
-        const startIdx = text.indexOf(TEST_START);
-        const endIdx = text.indexOf(TEST_END);
-        if (startIdx === -1 || endIdx === -1) return null;
-        return text.substring(startIdx + TEST_START.length, endIdx).trim();
+    function cleanAssembly(text) {
+        text = text.replace(/>>>CODE STARTS<<<[\s\S]*?>>>CODE ENDS<<</g, '');
+        text = text.replace(/OUTLINE:?\s*/gi, '');
+        var fenceRe = new RegExp(FENCE + '[a-z]*\\n?', 'g');
+        text = text.replace(fenceRe, '');
+        text = text.replace(/\n{3,}/g, '\n\n');
+        return text.trim();
     }
 
-    function runTestCode(testCode, mainCode) {
-        log('Running model-provided test code...', 'info');
+    function concatAll() {
+        return Object.keys(parts).filter(function (k) {
+            return k !== '__TEST__' && parts[k];
+        }).map(function (k) {
+            return '// === ' + k + ' ===\n' + parts[k];
+        }).join('\n\n');
+    }
+
+    function runTests(mainCode, testCode) {
+        log('Running tests...', 'info');
+        var synErr = checkSyntax(mainCode);
+        if (synErr) return { passed: false, errors: [synErr] };
+        return execTest(mainCode, testCode);
+    }
+
+    function checkSyntax(code) {
+        try { new Function(code); return null; }
+        catch (e) { return { type: 'SyntaxError', message: e.message }; }
+    }
+
+    function execTest(main, test) {
         try {
-            const wrapped = buildTestWrapper(testCode, mainCode);
-            const result = eval(wrapped);
-            return processTestResult(result);
+            var fn = new Function(
+                'var __e=[];' +
+                'var _l=console.log;console.log=function(){};' +
+                'try{' + main + '}catch(e){__e.push({type:e.name,message:e.message});}' +
+                'try{' + test + '}catch(e){__e.push({type:"TestFail",message:e.message});}' +
+                'console.log=_l;return{errors:__e};'
+            );
+            var r = fn();
+            if (r.errors.length) {
+                log('FAIL: ' + r.errors[0].message, 'error');
+                return { passed: false, errors: r.errors };
+            }
+            log('All tests passed!', 'success');
+            return { passed: true, errors: [] };
         } catch (e) {
             return { passed: false, errors: [{ type: e.name, message: e.message }] };
         }
     }
 
-    function buildTestWrapper(testCode, mainCode) {
-        return `(function(){
-            const __errs=[], __logs=[];
-            const _log = console.log;
-            console.log=(...a)=>{__logs.push(a.join(' '));};
-            try { ${mainCode} } catch(e){ __errs.push({type:e.name,message:e.message}); }
-            try { ${testCode} } catch(e){ __errs.push({type:'TestError',message:e.message}); }
-            console.log=_log;
-            return {errors:__errs,logs:__logs};
-        })()`;
-    }
-
-    function processTestResult(result) {
-        if (result.errors.length > 0) {
-            log(`Tests FAILED: ${result.errors[0].message}`, 'error');
-            return { passed: false, errors: result.errors, logs: result.logs };
-        }
-        log(`Tests PASSED ✓ (${result.logs.length} outputs)`, 'success');
-        return { passed: true, errors: [], logs: result.logs };
-    }
-
-    function syntaxCheck(code) {
-        try { new Function(code); return null; }
-        catch (e) { return { type: 'SyntaxError', message: e.message }; }
-    }
-
-    function buildFixPrompt(errors, code) {
-        let p = 'The code has bugs. Fix them and give the COMPLETE corrected code.\n\n';
-        p += '```javascript\n' + code + '\n```\n\nErrors:\n';
-        errors.forEach((e, i) => { p += `${i+1}. [${e.type}] ${e.message}\n`; });
-        p += `\nWhen done, end with: ${FINISH_SIGNAL}`;
-        return p;
-    }
-
-    function isJSLang(lang) {
-        return ['javascript','js','jsx','typescript','ts','tsx'].includes(lang);
-    }
-
-    /* ══════════════════════════════════════════════════════
-       PROMPT WRAPPING
-    ══════════════════════════════════════════════════════ */
-    function wrapPrompt(userText) {
-        return `${userText}
-
-IMPORTANT INSTRUCTIONS FOR YOUR RESPONSE:
-1. Modularize everything. All functions must be ~10 lines max. Break large functions into smaller helpers.
-2. Label each code block clearly: "JS Part", "HTML Part", "CSS Part", etc.
-3. If the code is JavaScript/TypeScript, include test code between these exact markers:
-   ${TEST_START}
-   // your test assertions here, e.g.:
-   // if (typeof myFunc !== 'function') throw new Error('myFunc not defined');
-   ${TEST_END}
-4. If the code is NOT JS (e.g. Python, HTML-only, etc.), do NOT include test markers.
-5. Use %%JS_PLACEHOLDER%% inside HTML where JS should be inserted, and %%CSS_PLACEHOLDER%% for CSS.
-6. When you are COMPLETELY finished with ALL code, end your response with exactly:
-   ${FINISH_SIGNAL}
-7. If your response gets cut off, I will ask you to continue. Pick up exactly where you left off.`;
-    }
-
-    function buildContinuePrompt(lastCode) {
-        const tail = lastCode.split('\n').filter(l => l.trim()).slice(-8).join('\n');
-        return `Continue from where you left off. Last lines:
-\`\`\`
-${tail}
-\`\`\`
-Continue immediately from there. Same rules apply. End with: ${FINISH_SIGNAL}`;
-    }
-
-    /* ══════════════════════════════════════════════════════
-       AUTO-CONTINUE ENGINE
-    ══════════════════════════════════════════════════════ */
-    function startEngine(userPrompt) {
-        running = true;
-        retryCount = 0;
-        mergedParts = [];
-        lastTurnCount = getTurnCount();
-        updateButton();
-        log('Engine started — submitting prompt...', 'success');
-        submitText(wrapPrompt(userPrompt));
-        setTimeout(() => beginPolling(), 4000);
-    }
-
-    function stopEngine() {
-        running = false;
-        clearPoll();
-        updateButton();
-        log('Engine stopped.', 'warn');
-    }
-
-    function beginPolling() {
-        if (!running) return;
-        clearPoll();
-        pollTimer = setInterval(() => pollCheck(), POLL_INTERVAL);
-    }
-
-    function clearPoll() {
-        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-    }
-
-    function pollCheck() {
-        if (!running) { clearPoll(); return; }
-        if (isStillGenerating()) { log('Generating...', 'info'); return; }
-        const turns = getTurnCount();
-        if (turns > lastTurnCount) {
-            lastTurnCount = turns;
-            clearPoll();
-            log(`Response #${turns} complete. Processing...`, 'info');
-            setTimeout(() => handleResponse(), DOM_SETTLE_MS);
-        }
-    }
-
-    function handleResponse() {
-        if (!running) return;
-        const text = getLatestText();
-        const codeEls = getLatestCodeBlocks();
-        collectParts(codeEls);
-        const testCode = extractTestCode(text);
-        const finished = text.includes(FINISH_SIGNAL);
-
-        if (finished) {
-            handleFinished(testCode);
-        } else {
-            handleCutOff();
-        }
-    }
-
-    function collectParts(codeEls) {
-        codeEls.forEach(el => {
-            const lang = detectLang(el);
-            const label = detectPartLabel(el);
-            const code = el.textContent.trim();
-            if (code.length > 10) addPart(code, label, lang);
+    function isJSLang() {
+        var jsKeys = Object.keys(parts).filter(function (k) {
+            return k.indexOf('JS') !== -1 || k.indexOf('TS') !== -1;
         });
+        return jsKeys.length > 0;
     }
 
-    function handleFinished(testCode) {
-        log('🎉 FINISH SIGNAL received!', 'success');
-        const jsParts = mergedParts.filter(p => isJSLang(p.lang));
+    function getJSCode() {
+        return Object.keys(parts).filter(function (k) {
+            return k !== '__TEST__' && (k.indexOf('JS') !== -1 || k.indexOf('TS') !== -1);
+        }).map(function (k) {
+            return parts[k] || '';
+        }).join('\n\n');
+    }
 
-        if (testCode && jsParts.length > 0) {
-            const jsCode = jsParts.map(p => p.code).join('\n\n');
-            const synErr = syntaxCheck(jsCode);
-            if (synErr) {
-                retryWithFix([synErr], jsCode);
-                return;
+    function start(userText) {
+        running = true;
+        parts = {};
+        outline = '';
+        currentPlaceholder = null;
+        retries = 0;
+        lastTurns = getTurns();
+        logEntries = [];
+        updateBtn();
+        showLog();
+        renderParts();
+        setProgress(0);
+        log('Starting...', 'success');
+        submitPrompt(buildInitialPrompt(userText));
+        setTimeout(function () { beginPoll(); }, 4000);
+    }
+
+    function stop() {
+        running = false;
+        clearPollInterval();
+        hideTimer();
+        updateBtn();
+        log('Stopped.', 'warn');
+    }
+
+    function beginPoll() {
+        if (!running) return;
+        clearPollInterval();
+        pollId = setInterval(function () {
+            if (!running) { clearPollInterval(); return; }
+            if (stillGenerating()) return;
+            var t = getTurns();
+            if (t > lastTurns) {
+                lastTurns = t;
+                clearPollInterval();
+                log('Response #' + t + ' received.', 'info');
+                setTimeout(function () { onResponse(); }, SETTLE_MS);
             }
-            const result = runTestCode(testCode, jsCode);
-            if (!result.passed && retryCount < MAX_RETRIES) {
-                retryWithFix(result.errors, jsCode);
+        }, POLL_MS);
+    }
+
+    function clearPollInterval() {
+        if (pollId) { clearInterval(pollId); pollId = null; }
+    }
+
+    function onResponse() {
+        if (!running) return;
+        var text = getLastTurnText();
+        parseResponse(text);
+        var finished = text.indexOf(FINISH) !== -1;
+        if (finished) {
+            onFinished();
+        } else {
+            onCutOff();
+        }
+    }
+
+    function onFinished() {
+        log('FINISH signal received!', 'success');
+        setProgress(100);
+        if (parts['__TEST__'] && isJSLang()) {
+            var jsCode = getJSCode();
+            var result = runTests(jsCode, parts['__TEST__']);
+            if (!result.passed && retries < MAX_RETRIES) {
+                retries++;
+                log('Tests failed. Fixing (attempt ' + retries + ')...', 'warn');
+                scheduleSubmit(buildFixPrompt(result.errors, jsCode));
                 return;
             }
         }
         finalize();
     }
 
-    function handleCutOff() {
-        retryCount++;
-        if (retryCount > MAX_RETRIES) {
-            log(`Max retries (${MAX_RETRIES}) hit. Finalizing what we have.`, 'error');
+    function onCutOff() {
+        retries++;
+        if (retries > MAX_RETRIES) {
+            log('Max retries (' + MAX_RETRIES + '). Finalizing.', 'error');
             finalize();
             return;
         }
-        log(`Cut off. Continuing (${retryCount}/${MAX_RETRIES})...`, 'warn');
-        const lastPart = mergedParts.length > 0 ? mergedParts[mergedParts.length - 1].code : '';
-        scheduleSubmit(buildContinuePrompt(lastPart));
-    }
-
-    function retryWithFix(errors, code) {
-        retryCount++;
-        if (retryCount > MAX_RETRIES) {
-            log('Max fix retries reached. Finalizing.', 'error');
-            finalize();
-            return;
-        }
-        log(`Fixing bugs (attempt ${retryCount})...`, 'warn');
-        scheduleSubmit(buildFixPrompt(errors, code));
+        log('Cut off. Continuing (' + retries + '/' + MAX_RETRIES + ')...', 'warn');
+        scheduleSubmit(buildContinuePrompt());
     }
 
     function scheduleSubmit(text) {
-        log(`Waiting ${SUBMIT_DELAY/1000}s before submit...`, 'info');
-        setTimeout(() => {
-            if (!running) return;
+        log('Waiting ' + (DELAY_MS / 1000) + 's...', 'info');
+        showTimer(DELAY_MS, 'next submit');
+        setTimeout(function () {
+            if (!running) { hideTimer(); return; }
+            hideTimer();
             log('Submitting...', 'info');
-            submitText(text);
-            lastTurnCount = getTurnCount();
-            setTimeout(() => beginPolling(), 5000);
-        }, SUBMIT_DELAY);
+            submitPrompt(text);
+            lastTurns = getTurns();
+            setTimeout(function () { beginPoll(); }, 5000);
+        }, DELAY_MS);
     }
 
     function finalize() {
-        const output = buildFinalOutput();
+        var output = assemble();
         showPanel(output);
-        stopEngine();
-        log(`✅ Done! ${mergedParts.length} parts merged.`, 'success');
+        stop();
+        log('Done! ' + Object.keys(parts).filter(function (k) {
+            return k !== '__TEST__' && parts[k];
+        }).length + ' parts assembled.', 'success');
     }
 
-    /* ══════════════════════════════════════════════════════
-       UI: SINGLE INPUT BAR
-    ══════════════════════════════════════════════════════ */
     function createUI() {
-        if (document.getElementById('acv5-bar')) return;
-        createInputBar();
-        createStatusBar();
-        createPanel();
-        hideOriginalInput();
+        if (document.getElementById('acv6-bar')) return;
+        createBar();
+        createLogPanel();
+        createTimerEl();
+        createProgressBar();
+        createPartsPanel();
+        createResultPanel();
+        //retryHideOriginal();
     }
 
-    function createInputBar() {
-        const bar = document.createElement('div');
-        bar.id = 'acv5-bar';
-        bar.innerHTML = `
-            <textarea id="acv5-input" placeholder="Type your prompt… (Enter = Go, Shift+Enter = newline)" rows="1"></textarea>
-            <button id="acv5-go">▶</button>
-        `;
+    function createBar() {
+        var bar = document.createElement('div');
+        bar.id = 'acv6-bar';
+        var input = document.createElement('textarea');
+        input.id = 'acv6-input';
+        input.placeholder = 'Type prompt... (Enter = Go, Shift+Enter = newline)';
+        input.rows = 1;
+        var btn = document.createElement('button');
+        btn.id = 'acv6-go';
+        btn.textContent = '\u25B6';
+        bar.appendChild(input);
+        bar.appendChild(btn);
         document.body.appendChild(bar);
-        bindInputEvents();
-    }
-
-    function bindInputEvents() {
-        const input = document.getElementById('acv5-input');
-        const btn = document.getElementById('acv5-go');
-        input.addEventListener('keydown', e => {
-            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); toggleAction(); }
+        input.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                toggleAction();
+            }
         });
         btn.addEventListener('click', toggleAction);
     }
 
     function toggleAction() {
-        if (running) { stopEngine(); return; }
-        const input = document.getElementById('acv5-input');
-        const text = input.value.trim();
-        if (!text) { log('Enter a prompt first.', 'warn'); return; }
+        if (running) { stop(); return; }
+        var input = document.getElementById('acv6-input');
+        var text = input.value.trim();
+        if (!text) { log('Enter a prompt.', 'warn'); return; }
         input.value = '';
-        startEngine(text);
+        start(text);
     }
 
-    function updateButton() {
-        const btn = document.getElementById('acv5-go');
+    function updateBtn() {
+        var btn = document.getElementById('acv6-go');
         if (!btn) return;
-        btn.textContent = running ? '⏹' : '▶';
-        btn.classList.toggle('running', running);
+        btn.textContent = running ? '\u23F9' : '\u25B6';
+        btn.className = running ? 'on' : '';
     }
 
-    function createStatusBar() {
-        const s = document.createElement('div');
-        s.id = 'acv5-status';
-        s.textContent = 'Ready';
-        document.body.appendChild(s);
+    function createLogPanel() {
+        var el = document.createElement('div');
+        el.id = 'acv6-log';
+        document.body.appendChild(el);
+        var toggle = document.createElement('button');
+        toggle.id = 'acv6-log-toggle';
+        toggle.textContent = '\uD83D\uDCCB';
+        toggle.addEventListener('click', function () {
+            el.classList.toggle('visible');
+        });
+        document.body.appendChild(toggle);
     }
 
-    /* ══════════════════════════════════════════════════════
-       UI: RESULT PANEL
-    ══════════════════════════════════════════════════════ */
-    function createPanel() {
-        if (document.getElementById('acv5-panel')) return;
-        const p = document.createElement('div');
-        p.id = 'acv5-panel';
-        p.innerHTML = `
-            <div id="acv5-panel-head">
-                <span>📦 Final Merged Code</span>
-                <span id="acv5-panel-info"></span>
-            </div>
-            <div id="acv5-panel-body"></div>
-            <div id="acv5-panel-foot">
-                <button class="acv5-pbtn acv5-pbtn--copy" id="acv5-p-copy">📋 Copy</button>
-                <button class="acv5-pbtn acv5-pbtn--dl" id="acv5-p-dl">💾 Download</button>
-                <button class="acv5-pbtn acv5-pbtn--close" id="acv5-p-close">✕ Close</button>
-            </div>
-        `;
-        document.body.appendChild(p);
-        bindPanelEvents();
+    function createTimerEl() {
+        var el = document.createElement('div');
+        el.id = 'acv6-timer';
+        el.innerHTML = [
+            '<svg class="acv6-ring" viewBox="0 0 36 36">',
+            '<circle class="acv6-ring-bg" cx="18" cy="18" r="16"/>',
+            '<circle class="acv6-ring-fg" id="acv6-ring-fg" cx="18" cy="18" r="16"/>',
+            '</svg>',
+            '<span id="acv6-timer-sec">30</span>',
+            '<span id="acv6-timer-lbl">waiting</span>'
+        ].join('');
+        document.body.appendChild(el);
     }
 
-    function bindPanelEvents() {
-        document.getElementById('acv5-p-close').addEventListener('click', hidePanel);
-        document.getElementById('acv5-p-copy').addEventListener('click', copyMerged);
-        document.getElementById('acv5-p-dl').addEventListener('click', downloadMerged);
+    function createProgressBar() {
+        var el = document.createElement('div');
+        el.id = 'acv6-progress';
+        el.innerHTML = '<div id="acv6-progress-fill"></div>';
+        document.body.appendChild(el);
+    }
+
+    function createPartsPanel() {
+        var el = document.createElement('div');
+        el.id = 'acv6-parts';
+        document.body.appendChild(el);
+    }
+
+    function createResultPanel() {
+        var el = document.createElement('div');
+        el.id = 'acv6-panel';
+        el.innerHTML = [
+            '<div id="acv6-panel-head">',
+            '<span>Final Merged Code</span>',
+            '<span id="acv6-panel-info"></span>',
+            '</div>',
+            '<div id="acv6-panel-body"></div>',
+            '<div id="acv6-panel-foot">',
+            '<button class="acv6-btn acv6-btn--cp" id="acv6-p-copy">Copy</button>',
+            '<button class="acv6-btn acv6-btn--dl" id="acv6-p-dl">Download</button>',
+            '<button class="acv6-btn acv6-btn--cl" id="acv6-p-close">Close</button>',
+            '</div>'
+        ].join('');
+        document.body.appendChild(el);
+        document.getElementById('acv6-p-close').addEventListener('click', hidePanel);
+        document.getElementById('acv6-p-copy').addEventListener('click', copyResult);
+        document.getElementById('acv6-p-dl').addEventListener('click', downloadResult);
     }
 
     function showPanel(code) {
-        const panel = document.getElementById('acv5-panel');
-        const body = document.getElementById('acv5-panel-body');
-        const info = document.getElementById('acv5-panel-info');
+        var panel = document.getElementById('acv6-panel');
+        var body = document.getElementById('acv6-panel-body');
+        var info = document.getElementById('acv6-panel-info');
         body.textContent = code;
-        info.textContent = `${mergedParts.length} parts · ${code.split('\n').length} lines`;
+        info.textContent = code.split('\n').length + ' lines';
         panel.classList.add('visible');
     }
 
     function hidePanel() {
-        document.getElementById('acv5-panel').classList.remove('visible');
+        document.getElementById('acv6-panel').classList.remove('visible');
     }
 
-    function copyMerged() {
-        const code = buildFinalOutput();
-        navigator.clipboard.writeText(code).then(() => log('Copied!', 'success'));
+    function copyResult() {
+        var code = assemble();
+        navigator.clipboard.writeText(code).then(function () {
+            log('Copied!', 'success');
+        });
     }
 
-    function downloadMerged() {
-        const code = buildFinalOutput();
-        const mainLang = detectMainLang();
-        const ext = getExtension(mainLang);
-        const blob = new Blob([code], { type: 'text/plain' });
-        const url = URL.createObjectURL(blob);
-        triggerDownload(url, `merged.${ext}`);
-        URL.revokeObjectURL(url);
-        log(`Downloaded merged.${ext}`, 'success');
-    }
-
-    function triggerDownload(url, filename) {
-        const a = document.createElement('a');
+    function downloadResult() {
+        var code = assemble();
+        var ext = isJSLang() ? 'html' : 'txt';
+        var blob = new Blob([code], { type: 'text/plain' });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
         a.href = url;
-        a.download = filename;
+        a.download = 'output.' + ext;
         document.body.appendChild(a);
         a.click();
         a.remove();
+        URL.revokeObjectURL(url);
+        log('Downloaded output.' + ext, 'success');
     }
 
-    function detectMainLang() {
-        if (mergedParts.length === 0) return 'txt';
-        const counts = {};
-        mergedParts.forEach(p => { counts[p.lang] = (counts[p.lang] || 0) + 1; });
-        return Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0];
-    }
-
-    function getExtension(lang) {
-        const map = { javascript:'js', js:'js', typescript:'ts', ts:'ts',
-            python:'py', html:'html', css:'css', json:'json',
-            bash:'sh', go:'go', rust:'rs', ruby:'rb', php:'php',
-            java:'java', cpp:'cpp', c:'c', swift:'swift', kotlin:'kt' };
-        return map[lang] || lang || 'txt';
-    }
-
-    /* ══════════════════════════════════════════════════════
-       CODE BLOCK MINI-TOOLBAR (minimal: just copy)
-    ══════════════════════════════════════════════════════ */
-    function attachMiniToolbar(fig) {
-        if (fig.hasAttribute(ATTR)) return;
-        fig.setAttribute(ATTR, '1');
-        if (getComputedStyle(fig).position === 'static') {
-            fig.style.position = 'relative';
-        }
-        const tb = buildMiniTB(fig);
-        fig.prepend(tb);
-    }
-
-    function buildMiniTB(fig) {
-        const tb = document.createElement('div');
-        tb.className = 'acv5-minitb';
-        const copyBtn = document.createElement('button');
-        copyBtn.className = 'acv5-mbtn';
-        copyBtn.textContent = '📋';
-        copyBtn.title = 'Copy code';
-        copyBtn.addEventListener('click', () => copyFigCode(fig, copyBtn));
-        tb.appendChild(copyBtn);
-        return tb;
-    }
-
-    function copyFigCode(fig, btn) {
-        const code = fig.querySelector('code');
-        if (!code) return;
-        navigator.clipboard.writeText(code.textContent).then(() => {
-            btn.textContent = '✓';
-            setTimeout(() => { btn.textContent = '📋'; }, 1200);
-        });
-    }
-
-    /* ══════════════════════════════════════════════════════
-       SCAN FOR NEW CODE BLOCKS
-    ══════════════════════════════════════════════════════ */
-    function scanCodeBlocks() {
-        const figures = document.querySelectorAll(`figure:not([${ATTR}])`);
-        figures.forEach(fig => {
-            if (fig.querySelector('code')) attachMiniToolbar(fig);
-        });
-    }
-
-    /* ══════════════════════════════════════════════════════
-       MUTATION OBSERVER & INIT
-    ══════════════════════════════════════════════════════ */
-    function setupObserver() {
-        const obs = new MutationObserver(() => scanCodeBlocks());
-        obs.observe(document.body, { childList: true, subtree: true });
-    }
-
-    function hideOriginalInputRetry() {
-        hideOriginalInput();
-        // Retry a few times since You.com loads dynamically
-        let attempts = 0;
-        const iv = setInterval(() => {
+    function retryHideOriginal() {
+        return;
+        var attempts = 0;
+        var iv = setInterval(function () {
             hideOriginalInput();
             attempts++;
-            if (attempts > 10) clearInterval(iv);
+            if (attempts > 15) clearInterval(iv);
         }, 2000);
     }
 
     function init() {
         injectStyles();
         createUI();
-        setupObserver();
-        scanCodeBlocks();
-        hideOriginalInputRetry();
-        log('Auto-Coder v5 ready. One button to rule them all.', 'success');
+        log('Auto-Coder v6 ready. One button.', 'success');
     }
 
-    /* ══════════════════════════════════════════════════════
-       BOOT
-    ══════════════════════════════════════════════════════ */
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', init);
     } else {
