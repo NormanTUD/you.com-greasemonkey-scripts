@@ -2,7 +2,7 @@
 // @name         Auto-Coder v7
 // @namespace    http://tampermonkey.net/
 // @version      7.0
-// @description  Minimal auto-continue + collect code. Reliable finish detection.
+// @description  Minimal auto-continue with proper overlap detection & reliable finish.
 // @match        https://you.com/*
 // @grant        none
 // ==/UserScript==
@@ -10,8 +10,14 @@
 (function() {
 'use strict';
 
-var POLL_MS = 2500, DELAY_MS = 25000, MAX = 15, DONE = '///DONE';
-var running = false, continues = 0, lastTurns = 0, code = '';
+var BT = String.fromCharCode(96);
+var FENCE = BT + BT + BT;
+var DONE = '///DONE';
+var POLL_MS = 2500;
+var DELAY_MS = 25000;
+var MAX = 15;
+
+var running = false, continues = 0, lastTurns = 0, codeBlocks = [];
 
 var $ = function(s) { return document.querySelector(s); };
 var getTurns = function() { return document.querySelectorAll('[data-testid^="youchat-answer-turn-"]').length; };
@@ -33,25 +39,49 @@ function submit(text) {
     }, 300);
 }
 
-function extractCode(text) {
-    var BT = String.fromCharCode(96);
-    var fence = BT + BT + BT;
-    var blocks = [], re = new RegExp(fence + '[\\w]*\\n([\\s\\S]*?)' + fence, 'g'), m;
+function extractFences(text) {
+    var blocks = [];
+    var re = new RegExp(FENCE + '[\\w]*\\n([\\s\\S]*?)' + FENCE, 'g');
+    var m;
     while ((m = re.exec(text)) !== null) blocks.push(m[1]);
-    return blocks.join('\n\n');
+    return blocks;
+}
+
+function getLastCodeTail(text) {
+    var blocks = extractFences(text);
+    if (blocks.length === 0) return '';
+    var last = blocks[blocks.length - 1];
+    var lines = last.split('\n');
+    return lines.slice(-8).join('\n');
+}
+
+function mergeOverlap(existing, fragment) {
+    if (!existing) return fragment;
+    if (!fragment) return existing;
+    var aL = existing.split('\n');
+    var bL = fragment.split('\n');
+    var maxCheck = Math.min(aL.length, bL.length, 20);
+    var best = 0;
+    for (var n = 1; n <= maxCheck; n++) {
+        var tail = aL.slice(-n).map(function(l) { return l.trim(); }).join('\n');
+        var head = bL.slice(0, n).map(function(l) { return l.trim(); }).join('\n');
+        if (tail === head) best = n;
+    }
+    if (best > 0) {
+        return existing + '\n' + bL.slice(best).join('\n');
+    }
+    return existing + '\n' + fragment;
 }
 
 function isDone(text) {
     if (text.indexOf(DONE) !== -1) return true;
-    var BT = String.fromCharCode(96);
-    var fence = BT + BT + BT;
-    var fenceCount = text.split(fence).length - 1;
+    var fenceCount = text.split(FENCE).length - 1;
     if (fenceCount % 2 !== 0) return false;
     var tail = text.slice(-300);
-    if (/\b(continue|next part|I'll|let me)\b/i.test(tail)) return false;
+    if (/\b(continue|next part|I'll continue|let me continue)\b/i.test(tail)) return false;
     var trimmed = text.trimEnd();
     var lastLine = trimmed.split('\n').pop().trim();
-    if (/[.;}\])\x60"']$/.test(lastLine)) return true;
+    if (/[.;}\])\x60"']$/.test(lastLine) && fenceCount > 0) return true;
     return false;
 }
 
@@ -67,14 +97,39 @@ function poll() {
 function handleResponse() {
     if (!running) return;
     var text = lastText();
-    code += '\n' + extractCode(text);
-    if (isDone(text) || continues >= MAX) { finish(); }
-    else {
+    var blocks = extractFences(text);
+
+    // Merge each block with overlap detection against accumulated code
+    for (var i = 0; i < blocks.length; i++) {
+        if (codeBlocks.length === 0) {
+            codeBlocks.push(blocks[i]);
+        } else {
+            var lastIdx = codeBlocks.length - 1;
+            var merged = mergeOverlap(codeBlocks[lastIdx], blocks[i]);
+            // If overlap found, merge into last block; otherwise push new
+            if (merged.length < codeBlocks[lastIdx].length + blocks[i].length + 5) {
+                codeBlocks[lastIdx] = merged;
+            } else {
+                codeBlocks.push(blocks[i]);
+            }
+        }
+    }
+
+    if (isDone(text) || continues >= MAX) {
+        finish();
+    } else {
         continues++;
         status('Continuing (' + continues + '/' + MAX + ')...');
+        var tail = getLastCodeTail(text);
         setTimeout(function() {
             if (!running) return;
-            submit('Continue exactly where you left off. When fully done write: ' + DONE);
+            var prompt = 'Continue EXACTLY where you left off.';
+            if (tail) {
+                prompt += ' The last lines you wrote were:\n' + FENCE + '\n' + tail + '\n' + FENCE + '\n';
+                prompt += 'Resume from the very next line after those.';
+            }
+            prompt += '\nWhen completely finished, write ' + DONE + ' on its own line.';
+            submit(prompt);
             setTimeout(poll, 4000);
         }, DELAY_MS);
     }
@@ -83,7 +138,7 @@ function handleResponse() {
 function finish() {
     running = false;
     updateBtn();
-    code = code.trim();
+    var code = codeBlocks.join('\n\n').trim();
     var panel = $('#acl-panel');
     panel.querySelector('pre').textContent = code;
     panel.style.display = 'flex';
@@ -91,7 +146,7 @@ function finish() {
 }
 
 function start(prompt) {
-    running = true; continues = 0; code = ''; lastTurns = getTurns();
+    running = true; continues = 0; codeBlocks = []; lastTurns = getTurns();
     updateBtn(); status('Submitting...');
     submit(prompt + '\n\nWhen completely finished, write "' + DONE + '" on its own line.');
     setTimeout(poll, 5000);
@@ -133,8 +188,12 @@ function initUI() {
     });
     $('#acl-btn').addEventListener('click', toggle);
     $('#acl-close').addEventListener('click', function() { panel.style.display = 'none'; });
-    $('#acl-copy').addEventListener('click', function() { navigator.clipboard.writeText(code).then(function() { status('Copied!'); }); });
+    $('#acl-copy').addEventListener('click', function() {
+        var code = codeBlocks.join('\n\n').trim();
+        navigator.clipboard.writeText(code).then(function() { status('Copied!'); });
+    });
     $('#acl-dl').addEventListener('click', function() {
+        var code = codeBlocks.join('\n\n').trim();
         var a = document.createElement('a');
         a.href = URL.createObjectURL(new Blob([code]));
         a.download = 'output.txt'; a.click();
