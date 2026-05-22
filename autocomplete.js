@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Auto-Coder v9
+// @name         Auto-Coder v10
 // @namespace    http://tampermonkey.net/
-// @version      9.0
-// @description  Auto-continue with smart overlap merge, safe markers, auto-harvest inline after each turn.
+// @version      10.1
+// @description  Auto-continue: detects incomplete code even without markers. Smart merge, harvest, skip timer.
 // @match        https://you.com/*
 // @grant        none
 // ==/UserScript==
@@ -13,7 +13,6 @@
 var BT = String.fromCharCode(96);
 var FENCE = BT + BT + BT;
 
-// SAFE MARKERS - no < > characters, cannot trigger blockquotes or HTML entities
 var FINISH = '!!!!!AUTOCODER_FINISHED!!!!!';
 var CODE_START = '!!!!!CODEBLOCK_STARTS!!!!!';
 var CODE_END = '!!!!!CODEBLOCK_ENDS!!!!!';
@@ -26,9 +25,7 @@ var POLL_MS = 2500;
 var running = false, continues = 0, lastTurns = 0;
 var accumulated = '', lastRawTail = '', prevHadUnclosedBlock = false;
 var waitTimer = null, waitRemaining = 0;
-var lastHarvestId = ''; // track which injected block we already placed
 
-// Counter state
 var totalGenerations = 0;
 var processingCount = 0;
 var doneCount = 0;
@@ -37,6 +34,10 @@ var $ = function(s) { return document.querySelector(s); };
 var $$ = function(s) { return document.querySelectorAll(s); };
 var getTurns = function() { return $$('[data-testid^="youchat-answer-turn-"]').length; };
 var isGen = function() { return $$('[data-testid^="step-"][data-finished="false"]').length > 0; };
+
+// ============================================================
+// COUNTER & TITLE
+// ============================================================
 
 function updateTitle() {
     var title = '';
@@ -80,7 +81,10 @@ function markDone() {
     playSuccessSound();
 }
 
-// === Web Audio API Sounds ===
+// ============================================================
+// WEB AUDIO API SOUNDS
+// ============================================================
+
 var audioCtx = null;
 function getAudioCtx() {
     if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -115,6 +119,10 @@ function playSuccessSound() {
     playTone(659.25, now + 0.1, 0.15);
     playTone(783.99, now + 0.2, 0.3);
 }
+
+// ============================================================
+// DOM HELPERS
+// ============================================================
 
 function lastTurnEl() {
     var all = $$('[data-testid^="youchat-answer-turn-"]');
@@ -163,13 +171,60 @@ function unesc(code) {
 }
 
 // ============================================================
-// IMPROVED MERGE - prevents partial-line duplication
-// The old algorithm matched trimmed lines which caused issues
-// when a line was cut mid-way (e.g. "const rx =") and the next
-// fragment repeated the full line. New approach:
-// 1. Try exact line matching (not trimmed) for overlap
-// 2. If a partial last line exists in A, check if B starts with
-//    a line that completes/replaces it
+// CODE COMPLETENESS DETECTION
+// ============================================================
+
+function isCodeIncomplete(code) {
+    if (!code || code.trim().length === 0) return false;
+
+    var trimmed = code.trim();
+    var lines = trimmed.split('\n');
+    var lastLine = lines[lines.length - 1].trim();
+
+    // If it ends with </html>, it's done
+    if (/^<\/html>$/i.test(lastLine)) return false;
+    if (/<\/html>\s*$/i.test(trimmed.slice(-30))) return false;
+
+    // If the last line is clearly cut off mid-expression
+    if (/[+\-*\/=,({;|&:]$/.test(lastLine)) return true;
+    if (/\($/.test(lastLine)) return true;
+
+    // Check second-to-last non-empty line if last is empty
+    if (/^\s*$/.test(lastLine) && lines.length > 5) {
+        for (var i = lines.length - 2; i >= 0; i--) {
+            var l = lines[i].trim();
+            if (l.length > 0) {
+                if (/[+\-*\/=,({;|&:]$/.test(l)) return true;
+                break;
+            }
+        }
+    }
+
+    // Check structural completeness
+    var hasDoctype = /<!DOCTYPE/i.test(trimmed);
+    var hasHtmlClose = /<\/html>/i.test(trimmed);
+    if (hasDoctype && !hasHtmlClose) return true;
+
+    // Check for unbalanced braces
+    var openBraces = (trimmed.match(/\{/g) || []).length;
+    var closeBraces = (trimmed.match(/\}/g) || []).length;
+    if (openBraces - closeBraces > 2) return true;
+
+    // Check script tags
+    var scriptOpens = (trimmed.match(/<script/gi) || []).length;
+    var scriptCloses = (trimmed.match(/<\/script>/gi) || []).length;
+    if (scriptOpens > scriptCloses) return true;
+
+    // Check style tags
+    var styleOpens = (trimmed.match(/<style/gi) || []).length;
+    var styleCloses = (trimmed.match(/<\/style>/gi) || []).length;
+    if (styleOpens > styleCloses) return true;
+
+    return false;
+}
+
+// ============================================================
+// IMPROVED MERGE
 // ============================================================
 
 function mergeOverlap(existing, fragment) {
@@ -179,28 +234,24 @@ function mergeOverlap(existing, fragment) {
     var aL = existing.split('\n');
     var bL = fragment.split('\n');
 
-    // Step 1: Check if the last line of A is a truncated version of the first meaningful line of B
-    // This handles the "const rx =" vs "const rx = (1-t1)..." case
+    // Step 1: Check if last line of A is truncated version of first line of B
     var lastLineA = aL[aL.length - 1];
     var lastLineTrimA = lastLineA.trim();
 
     if (lastLineTrimA.length > 0 && bL.length > 0) {
-        // Find first non-empty line in B
         var firstBIdx = 0;
         while (firstBIdx < bL.length && bL[firstBIdx].trim() === '') firstBIdx++;
 
         if (firstBIdx < bL.length) {
             var firstLineB = bL[firstBIdx].trim();
-            // If last line of A is a prefix/substring of first line of B, it was truncated
             if (firstLineB.length > lastLineTrimA.length && firstLineB.indexOf(lastLineTrimA) === 0) {
-                // Remove the truncated line from A, let B's full version take over
                 aL.pop();
                 existing = aL.join('\n');
             }
         }
     }
 
-    // Step 2: Standard overlap detection with EXACT matching (no trim)
+    // Step 2: Standard overlap detection
     aL = existing.split('\n');
     var maxCheck = Math.min(aL.length, bL.length, 30);
     var best = 0;
@@ -220,20 +271,16 @@ function mergeOverlap(existing, fragment) {
         return existing + '\n' + bL.slice(best).join('\n');
     }
 
-    // Step 3: Check for partial overlap where B repeats some lines from end of A
-    // Look for any sequence of 2+ consecutive lines from end of A appearing at start of B
+    // Step 3: Partial overlap search
     for (var startB = 0; startB < Math.min(5, bL.length); startB++) {
         if (bL[startB].trim() === '') continue;
-        // Search for this line in the tail of A
         for (var posA = Math.max(0, aL.length - 30); posA < aL.length; posA++) {
             if (aL[posA].trim() === bL[startB].trim()) {
-                // Check if subsequent lines also match
                 var matchLen = 1;
                 while (posA + matchLen < aL.length && startB + matchLen < bL.length &&
                        aL[posA + matchLen].trim() === bL[startB + matchLen].trim()) {
                     matchLen++;
                 }
-                // If we matched to the end of A, this is our overlap point
                 if (posA + matchLen >= aL.length && matchLen >= 2) {
                     return aL.slice(0, posA).join('\n') + '\n' + bL.slice(startB).join('\n');
                 }
@@ -241,7 +288,6 @@ function mergeOverlap(existing, fragment) {
         }
     }
 
-    // No overlap found - just concatenate
     return existing + '\n' + fragment;
 }
 
@@ -250,7 +296,7 @@ function getRawTail() {
     if (!code || code.trim().length === 0) {
         if (accumulated) {
             var accLines = accumulated.split('\n');
-            return accLines.slice(-3).join('\n');
+            return accLines.slice(-5).join('\n');
         }
         return '';
     }
@@ -260,19 +306,18 @@ function getRawTail() {
         if (lines[i].trim().length > 0 || meaningful.length > 0) {
             meaningful.unshift(lines[i]);
         }
-        if (meaningful.length >= 3) break;
+        if (meaningful.length >= 5) break;
     }
     return meaningful.join('\n');
 }
 
 // ============================================================
-// MARKER DETECTION - using the new safe markers
+// MARKER DETECTION & CODE EXTRACTION
 // ============================================================
 
 function isDone(text) {
     if (text.indexOf(FINISH) !== -1) return true;
     if (text.indexOf('AUTOCODER_FINISHED') !== -1) return true;
-    // Also check DOM spans
     var lastEl = lastTurnEl();
     if (lastEl) {
         var spans = lastEl.querySelectorAll('[data-testid="youchat-text"]');
@@ -289,7 +334,6 @@ function extractCode(text) {
     var idx = 0;
     var foundAny = false;
 
-    // Search for markers in text
     var startMarkers = [CODE_START, 'CODEBLOCK_STARTS!!!!!'];
     var endMarkers = [CODE_END, 'CODEBLOCK_ENDS!!!!!'];
 
@@ -330,29 +374,16 @@ function extractCode(text) {
         idx = ei + usedEndLen;
     }
 
-    // Fallback: check DOM spans for markers, then grab code blocks
+    // Fallback: no markers found - grab code from DOM directly
     if (!foundAny) {
-        var lastEl = lastTurnEl();
-        if (lastEl) {
-            var spans = lastEl.querySelectorAll('[data-testid="youchat-text"]');
-            var hasStart = false;
-            for (var i = 0; i < spans.length; i++) {
-                var t = spans[i].textContent || '';
-                if (t.indexOf('CODEBLOCK_STARTS') !== -1) hasStart = true;
-            }
-            if (hasStart || prevHadUnclosedBlock) {
-                var domCode = lastCodeFromDOM();
-                if (domCode) {
-                    result = domCode;
-                    foundAny = true;
-                }
+        var domCode = lastCodeFromDOM();
+        if (domCode && domCode.trim().length > 20) {
+            result = domCode;
+            foundAny = true;
+            if (isCodeIncomplete(domCode)) {
+                prevHadUnclosedBlock = true;
             }
         }
-    }
-
-    if (!foundAny && prevHadUnclosedBlock) {
-        var domCode2 = lastCodeFromDOM();
-        if (domCode2) result = domCode2;
     }
 
     return unesc(result);
@@ -378,8 +409,7 @@ function stripFence(block) {
 }
 
 // ============================================================
-// INLINE CODE BLOCK INJECTION (no popup)
-// Always shows after last turn, updates in place, only once per harvest
+// INLINE CODE BLOCK INJECTION
 // ============================================================
 
 function injectCodeBlock(code) {
@@ -389,7 +419,6 @@ function injectCodeBlock(code) {
     var blockId = 'acl-injected-block';
     var old = document.getElementById(blockId);
 
-    // If block already exists, just update its content
     if (old) {
         var oldCode = old.querySelector('code');
         var oldHeader = old.querySelector('.acl-header-text');
@@ -449,7 +478,6 @@ function injectCodeBlock(code) {
     wrapper.appendChild(header);
     wrapper.appendChild(pre);
 
-    // Insert after the last turn
     var container = lastTurn.parentElement;
     if (container) {
         container.insertBefore(wrapper, lastTurn.nextSibling);
@@ -459,67 +487,8 @@ function injectCodeBlock(code) {
 }
 
 // ============================================================
-// HARVEST - Collect all code blocks from all turns
+// HARVEST
 // ============================================================
-
-
-
-// ============================================================
-// HARVEST FUNCTION - Fixed to work with current You.com DOM
-// Tries multiple selectors, grabs all <pre><code> on page
-// ============================================================
-
-function harvestAllCode() {
-    // Try multiple selectors for answer turns
-    var turns = document.querySelectorAll('[data-testid^="youchat-answer-turn-"]');
-    
-    // Fallback: if no turns found, try other known containers
-    if (!turns || turns.length === 0) {
-        turns = document.querySelectorAll('[class*="answer"], [class*="response"], [data-testid*="answer"]');
-    }
-
-    // Nuclear fallback: just grab ALL code blocks on the page
-    if (!turns || turns.length === 0) {
-        var allCodeEls = document.querySelectorAll('pre code');
-        if (allCodeEls.length === 0) {
-            // Try pre without code child
-            allCodeEls = document.querySelectorAll('pre');
-        }
-        if (allCodeEls.length === 0) return '';
-
-        var allCode = '';
-        for (var i = 0; i < allCodeEls.length; i++) {
-            var raw = allCodeEls[i].textContent || '';
-            if (raw.trim().length < 10) continue; // skip tiny snippets
-            var cleaned = cleanMarkers(raw);
-            if (cleaned.trim().length > 0) {
-                allCode = mergeOverlap(allCode, cleaned);
-            }
-        }
-        allCode = unesc(allCode);
-        return allCode.trim();
-    }
-
-    // Normal path: iterate turns
-    var allCode = '';
-    for (var i = 0; i < turns.length; i++) {
-        var codeEls = turns[i].querySelectorAll('pre code');
-        if (codeEls.length === 0) {
-            codeEls = turns[i].querySelectorAll('pre');
-        }
-        for (var j = 0; j < codeEls.length; j++) {
-            var raw = codeEls[j].textContent || '';
-            if (raw.trim().length < 10) continue;
-            var cleaned = cleanMarkers(raw);
-            if (cleaned.trim().length > 0) {
-                allCode = mergeOverlap(allCode, cleaned);
-            }
-        }
-    }
-
-    allCode = unesc(allCode);
-    return allCode.trim();
-}
 
 function cleanMarkers(code) {
     return code
@@ -537,14 +506,56 @@ function cleanMarkers(code) {
         .replace(/\n+$/, '');
 }
 
+function harvestAllCode() {
+    var turns = document.querySelectorAll('[data-testid^="youchat-answer-turn-"]');
+
+    if (!turns || turns.length === 0) {
+        turns = document.querySelectorAll('[class*="answer"], [class*="response"], [data-testid*="answer"]');
+    }
+
+    // Nuclear fallback: grab ALL code blocks on page
+    if (!turns || turns.length === 0) {
+        var allCodeEls = document.querySelectorAll('pre code');
+        if (allCodeEls.length === 0) allCodeEls = document.querySelectorAll('pre');
+        if (allCodeEls.length === 0) return '';
+
+        var allCode = '';
+        for (var i = 0; i < allCodeEls.length; i++) {
+            var raw = allCodeEls[i].textContent || '';
+            if (raw.trim().length < 10) continue;
+            var cleaned = cleanMarkers(raw);
+            if (cleaned.trim().length > 0) {
+                allCode = mergeOverlap(allCode, cleaned);
+            }
+        }
+        return unesc(allCode).trim();
+    }
+
+    var allCode = '';
+    for (var i = 0; i < turns.length; i++) {
+        var codeEls = turns[i].querySelectorAll('pre code');
+        if (codeEls.length === 0) codeEls = turns[i].querySelectorAll('pre');
+        for (var j = 0; j < codeEls.length; j++) {
+            var raw = codeEls[j].textContent || '';
+            if (raw.trim().length < 10) continue;
+            var cleaned = cleanMarkers(raw);
+            if (cleaned.trim().length > 0) {
+                allCode = mergeOverlap(allCode, cleaned);
+            }
+        }
+    }
+
+    return unesc(allCode).trim();
+}
+
 function doHarvest() {
     status('\uD83C\uDF3E Harvesting...');
-    
+
     var code = harvestAllCode();
 
     if (!code || code.length === 0) {
-        status('\u26A0 No code blocks found. Found ' + document.querySelectorAll('pre code').length + ' <pre><code> elements.');
-        console.log('[ACL Harvest] No code found. DOM debug:', {
+        status('\u26A0 No code found. ' + document.querySelectorAll('pre code').length + ' code elements on page.');
+        console.log('[ACL] Harvest debug:', {
             turns: document.querySelectorAll('[data-testid^="youchat-answer-turn-"]').length,
             preCodes: document.querySelectorAll('pre code').length,
             pres: document.querySelectorAll('pre').length
@@ -559,13 +570,12 @@ function doHarvest() {
         status('\uD83C\uDF3E ' + code.split('\n').length + ' lines harvested & copied!');
         playSuccessSound();
     }).catch(function() {
-        status('\uD83C\uDF3E ' + code.split('\n').length + ' lines harvested! (clipboard blocked)');
+        status('\uD83C\uDF3E ' + code.split('\n').length + ' lines harvested!');
     });
 }
 
 // ============================================================
 // AUTO-HARVEST OBSERVER
-// Watches for new turns completing, then auto-harvests inline
 // ============================================================
 
 var autoHarvestObserver = null;
@@ -574,15 +584,11 @@ var lastAutoHarvestTurns = 0;
 function startAutoHarvest() {
     if (autoHarvestObserver) return;
 
-    var target = document.body;
     autoHarvestObserver = new MutationObserver(function() {
-        // Check if generation just finished (no more generating indicators)
         if (isGen()) return;
-
         var currentTurns = getTurns();
         if (currentTurns > lastAutoHarvestTurns) {
             lastAutoHarvestTurns = currentTurns;
-            // Delay slightly to let DOM settle
             setTimeout(function() {
                 if (!isGen()) {
                     var code = harvestAllCode();
@@ -595,7 +601,7 @@ function startAutoHarvest() {
         }
     });
 
-    autoHarvestObserver.observe(target, { childList: true, subtree: true });
+    autoHarvestObserver.observe(document.body, { childList: true, subtree: true });
 }
 
 // ============================================================
@@ -616,7 +622,15 @@ function handleResponse() {
     var text = lastText();
     var newCode = extractCode(text);
 
-    if (newCode) {
+    // FALLBACK: If extractCode returned nothing, grab from DOM directly
+    if (!newCode || newCode.trim().length === 0) {
+        var domCode = lastCodeFromDOM();
+        if (domCode && domCode.trim().length > 20) {
+            newCode = domCode;
+        }
+    }
+
+    if (newCode && newCode.trim().length > 0) {
         accumulated = mergeOverlap(accumulated, newCode);
     }
 
@@ -627,8 +641,20 @@ function handleResponse() {
         injectCodeBlock(accumulated.trim());
     }
 
-    if (isDone(text) || continues >= MAX) { finish(); }
-    else { scheduleNext(); }
+    // Determine completion
+    if (isDone(text)) {
+        finish();
+    } else if (continues >= MAX) {
+        finish();
+    } else if (isCodeIncomplete(accumulated)) {
+        status('\u26A0 Code incomplete, auto-continuing...');
+        scheduleNext();
+    } else if (!accumulated || accumulated.trim().length === 0) {
+        status('\u26A0 No code detected, stopping.');
+        finish();
+    } else {
+        finish();
+    }
 }
 
 function scheduleNext() {
@@ -679,31 +705,20 @@ function buildContinue() {
     var tail = lastRawTail;
     if (!tail || tail.trim().length === 0) {
         var accLines = accumulated.split('\n');
-        tail = accLines.slice(-3).join('\n');
+        tail = accLines.slice(-5).join('\n');
     }
     var lines = [];
-    lines.push('Continue EXACTLY where you left off. Here are the last lines you wrote:');
+    lines.push('Continue EXACTLY where you left off. Your last lines were:');
     lines.push('');
     lines.push(FENCE);
     lines.push(tail);
     lines.push(FENCE);
     lines.push('');
-    lines.push('Your response MUST start with exactly these two lines:');
-    lines.push(CODE_START);
-    lines.push(FENCE + 'html');
+    lines.push('Continue from there. Do NOT repeat those lines. Just write the next code.');
+    lines.push('When you are 100% completely done with the ENTIRE file, write this AFTER your code block:');
+    lines.push(FINISH);
     lines.push('');
-    lines.push('Then repeat those last 2 lines for overlap, then continue the code.');
-    lines.push('');
-    lines.push('RULES:');
-    lines.push('- First line of your response: ' + CODE_START);
-    lines.push('- Second line: ' + FENCE + 'html');
-    lines.push('- Then code (repeat last 2 lines for overlap, then new code)');
-    lines.push('- Replace all backticks inside your code with: ' + BACKTICK_ESC);
-    lines.push('- When 100% done close with: ' + FENCE);
-    lines.push('  Then on next line: ' + CODE_END);
-    lines.push('  Then on next line: ' + FINISH);
-    lines.push('');
-    lines.push('IMPORTANT: Markers must appear EXACTLY as shown. No modifications.');
+    lines.push('If you are NOT done yet, just stop. I will ask again.');
     return lines.join('\n');
 }
 
@@ -711,22 +726,14 @@ function buildInitial(userText) {
     var lines = [];
     lines.push(userText);
     lines.push('');
-    lines.push('=== OUTPUT RULES ===');
-    lines.push('1. Wrap ALL code between these exact markers on their own lines:');
-    lines.push('   ' + CODE_START);
-    lines.push('   ' + FENCE + 'html');
-    lines.push('   ...your code...');
-    lines.push('   ' + FENCE);
-    lines.push('   ' + CODE_END);
-    lines.push('2. Replace EVERY backtick inside your code with: ' + BACKTICK_ESC);
-    lines.push('3. When completely finished, write on its own line: ' + FINISH);
-    lines.push('4. If response gets long, just stop mid-code. I will say continue.');
+    lines.push('=== RULES ===');
+    lines.push('Write the complete code in a single code block.');
+    lines.push('If you run out of space, just stop mid-code. I will ask you to continue.');
+    lines.push('When you are 100% completely finished with the ENTIRE file, write this AFTER your code block on its own line:');
+    lines.push(FINISH);
     lines.push('');
-    lines.push('IMPORTANT: These markers must appear EXACTLY as written:');
-    lines.push('  Start: ' + CODE_START);
-    lines.push('  End:   ' + CODE_END);
-    lines.push('  Done:  ' + FINISH);
-    lines.push('==================');
+    lines.push('Do NOT write ' + FINISH + ' unless the code is truly 100% complete.');
+    lines.push('=============');
     return lines.join('\n');
 }
 
@@ -745,7 +752,9 @@ function finish() {
     injectCodeBlock(code);
 
     navigator.clipboard.writeText(code).then(function() {
-        status('\u2705 Done! ' + code.split('\n').length + ' lines \u2014 injected & copied.');
+        status('\u2705 Done! ' + code.split('\n').length + ' lines \u2014 copied!');
+    }).catch(function() {
+        status('\u2705 Done! ' + code.split('\n').length + ' lines.');
     });
 }
 
@@ -773,6 +782,10 @@ function updateBtn() {
     btn.textContent = running ? '\u23F9' : '\u25B6';
     btn.className = running ? 'acl-on' : '';
 }
+
+// ============================================================
+// UI INITIALIZATION
+// ============================================================
 
 function initUI() {
     var s = document.createElement('style');
@@ -835,6 +848,7 @@ function initUI() {
     panel.innerHTML = '<pre></pre><div id="acl-panel-bar"><button id="acl-copy" style="background:linear-gradient(135deg,#2563eb,#1d4ed8);color:#fff">Copy</button><button id="acl-dl" style="background:linear-gradient(135deg,#d97706,#b45309);color:#fff">Download</button><button id="acl-close" style="background:linear-gradient(135deg,#374151,#1f2937);color:#fff">Close</button></div>';
     document.body.appendChild(panel);
 
+    // Event listeners
     $('#acl-input').addEventListener('keydown', function(e) {
         if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); toggle(); }
     });
@@ -843,7 +857,9 @@ function initUI() {
     $('#acl-skip').addEventListener('click', doSkip);
     $('#acl-close').addEventListener('click', function() { panel.style.display = 'none'; });
     $('#acl-copy').addEventListener('click', function() {
-        navigator.clipboard.writeText(accumulated.trim()).then(function() { status('\u2705 Copied!'); });
+        navigator.clipboard.writeText(accumulated.trim()).then(function() {
+            status('\u2705 Copied!');
+        });
     });
     $('#acl-dl').addEventListener('click', function() {
         var a = document.createElement('a');
@@ -852,8 +868,6 @@ function initUI() {
     });
 
     updateCounter();
-
-    // Start auto-harvest observer
     startAutoHarvest();
 }
 
@@ -866,6 +880,11 @@ function toggle() {
     start(text);
 }
 
+// ============================================================
+// STARTUP
+// ============================================================
+
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initUI);
 else initUI();
+
 })();
