@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Auto-Coder v7
 // @namespace    http://tampermonkey.net/
-// @version      7.3
-// @description  Auto-continue with overlap, skip button, injects final code block into page. Now with generation counter & dynamic title.
+// @version      7.4
+// @description  Auto-continue with overlap, skip button, injects final code block into page. Fixed marker detection. Harvest button for manual/reload use.
 // @match        https://you.com/*
 // @grant        none
 // ==/UserScript==
@@ -30,8 +30,9 @@ var processingCount = 0;
 var doneCount = 0;
 
 var $ = function(s) { return document.querySelector(s); };
-var getTurns = function() { return document.querySelectorAll('[data-testid^="youchat-answer-turn-"]').length; };
-var isGen = function() { return document.querySelectorAll('[data-testid^="step-"][data-finished="false"]').length > 0; };
+var $$ = function(s) { return document.querySelectorAll(s); };
+var getTurns = function() { return $$('[data-testid^="youchat-answer-turn-"]').length; };
+var isGen = function() { return $$('[data-testid^="step-"][data-finished="false"]').length > 0; };
 
 function updateTitle() {
     var title = '';
@@ -112,9 +113,13 @@ function playSuccessSound() {
 }
 
 function lastTurnEl() {
-    var all = document.querySelectorAll('[data-testid^="youchat-answer-turn-"]');
+    var all = $$('[data-testid^="youchat-answer-turn-"]');
     if (!all.length) return null;
     return all[all.length - 1];
+}
+
+function allTurnEls() {
+    return $$('[data-testid^="youchat-answer-turn-"]');
 }
 
 function lastText() {
@@ -122,8 +127,7 @@ function lastText() {
     return el ? el.innerText : '';
 }
 
-function lastCodeFromDOM() {
-    var el = lastTurnEl();
+function getCodeFromTurnEl(el) {
     if (!el) return '';
     var codeEls = el.querySelectorAll('pre code');
     if (codeEls.length === 0) return '';
@@ -134,46 +138,108 @@ function lastCodeFromDOM() {
     return allCode;
 }
 
-function submit(text) {
-    var ta = $('#search-input-textarea');
-    if (!ta) return;
-    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, text);
-    ta.dispatchEvent(new Event('input', { bubbles: true }));
-    setTimeout(function() {
-        var form = ta.closest('form');
-        var btn = form && form.querySelector('button[type="submit"],[data-testid="search-input-send-button"]');
-        if (btn) { btn.disabled = false; btn.click(); }
-    }, 300);
+function lastCodeFromDOM() {
+    return getCodeFromTurnEl(lastTurnEl());
 }
 
-function unesc(code) { return code.replace(/>>>BACKTICK<<</g, BT); }
+// ============================================================
+// IMPROVED MARKER DETECTION
+// The >>> markers get rendered as blockquotes in the DOM.
+// We need to detect them from the raw text AND from the DOM structure.
+// ============================================================
+
+function normalizeMarkerText(text) {
+    // The DOM renders >>>X<<< as nested blockquotes, so innerText may show:
+    // "CODE STARTS<<<" or "CODE ENDS<<<" or "FINISHED<<<" without the leading >>>
+    // Also handle cases where it appears with > > > prefix from blockquote rendering
+    var normalized = text;
+    // Strip leading > characters and spaces (blockquote artifacts)
+    normalized = normalized.replace(/^[\s>]+/gm, '');
+    return normalized;
+}
+
+function isDone(text) {
+    var norm = normalizeMarkerText(text);
+    // Check for the full marker
+    if (norm.indexOf(FINISH) !== -1) return true;
+    // Check for partial marker (without leading >>>)
+    if (norm.indexOf('FINISHED<<<') !== -1) return true;
+    if (norm.indexOf('FINISHED') !== -1 && norm.indexOf('<<<') !== -1) return true;
+    // Check the tail
+    var tail = norm.slice(-300);
+    if (tail.indexOf('CODE ENDS') !== -1 && tail.indexOf('FINISHED') !== -1) return true;
+    // Check DOM for the data-testid="youchat-text" spans containing markers
+    var lastEl = lastTurnEl();
+    if (lastEl) {
+        var textSpans = lastEl.querySelectorAll('[data-testid="youchat-text"]');
+        for (var i = 0; i < textSpans.length; i++) {
+            var spanText = textSpans[i].textContent || '';
+            if (spanText.indexOf('FINISHED') !== -1 && spanText.indexOf('<<<') !== -1) return true;
+            if (spanText.indexOf('CODE ENDS') !== -1 && spanText.indexOf('<<<') !== -1) return true;
+        }
+    }
+    return false;
+}
 
 function extractCode(text) {
+    var norm = normalizeMarkerText(text);
     var result = '';
     var idx = 0;
     var foundAny = false;
+
+    // Try full markers first
+    var startMarker = CODE_START;
+    var endMarker = CODE_END;
+
+    // Also try without >>> prefix
+    var altStarts = [CODE_START, 'CODE STARTS<<<'];
+    var altEnds = [CODE_END, 'CODE ENDS<<<'];
+
     while (true) {
-        var si = text.indexOf(CODE_START, idx);
+        var si = -1;
+        var usedStartMarker = '';
+        for (var s = 0; s < altStarts.length; s++) {
+            var found = norm.indexOf(altStarts[s], idx);
+            if (found !== -1 && (si === -1 || found < si)) {
+                si = found;
+                usedStartMarker = altStarts[s];
+            }
+        }
         if (si === -1) break;
         foundAny = true;
-        var ei = text.indexOf(CODE_END, si);
+
+        var ei = -1;
+        var usedEndMarker = '';
+        for (var e = 0; e < altEnds.length; e++) {
+            var foundEnd = norm.indexOf(altEnds[e], si + usedStartMarker.length);
+            if (foundEnd !== -1 && (ei === -1 || foundEnd < ei)) {
+                ei = foundEnd;
+                usedEndMarker = altEnds[e];
+            }
+        }
+
         var raw;
         if (ei === -1) {
-            raw = text.substring(si + CODE_START.length);
+            raw = norm.substring(si + usedStartMarker.length);
             prevHadUnclosedBlock = true;
         } else {
-            raw = text.substring(si + CODE_START.length, ei);
+            raw = norm.substring(si + usedStartMarker.length, ei);
             prevHadUnclosedBlock = false;
         }
         var code = stripFence(raw);
         if (code) result += (result ? '\n' : '') + code;
         if (ei === -1) break;
-        idx = ei + CODE_END.length;
+        idx = ei + usedEndMarker.length;
     }
-    if (!foundAny && prevHadUnclosedBlock) {
-        var domCode = lastCodeFromDOM();
-        if (domCode) result = domCode;
+
+    // Fallback: if no markers found, try extracting from DOM code blocks directly
+    if (!foundAny) {
+        if (prevHadUnclosedBlock) {
+            var domCode = lastCodeFromDOM();
+            if (domCode) result = domCode;
+        }
     }
+
     return unesc(result);
 }
 
@@ -187,9 +253,12 @@ function stripFence(block) {
         if (inFence) out.push(l);
     }
     if (out.length === 0) {
+        // No fences found - maybe the code is raw
         var start = 0;
         if (lines.length > 0 && /^\s*$/.test(lines[0])) start = 1;
-        return lines.slice(start).join('\n');
+        var end = lines.length;
+        if (end > 0 && /^\s*$/.test(lines[end - 1])) end--;
+        return lines.slice(start, end).join('\n');
     }
     return out.join('\n');
 }
@@ -230,13 +299,19 @@ function getRawTail() {
     return meaningful.join('\n');
 }
 
-function isDone(text) {
-    if (text.indexOf(FINISH) !== -1) return true;
-    var tail = text.slice(-200);
-    if (tail.indexOf(CODE_END) !== -1 && tail.indexOf(FINISH) !== -1) return true;
-    if (tail.indexOf('FINISHED') !== -1 && tail.indexOf('>>>') !== -1) return true;
-    return false;
+function submit(text) {
+    var ta = $('#search-input-textarea');
+    if (!ta) return;
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, text);
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    setTimeout(function() {
+        var form = ta.closest('form');
+        var btn = form && form.querySelector('button[type="submit"],[data-testid="search-input-send-button"]');
+        if (btn) { btn.disabled = false; btn.click(); }
+    }, 300);
 }
+
+function unesc(code) { return code.replace(/>>>BACKTICK<<</g, BT); }
 
 function poll() {
     if (!running) return;
@@ -369,6 +444,9 @@ function injectCodeBlock(code) {
     header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:#1a1528;border-bottom:1px solid #333;';
     header.innerHTML = '<span style="color:#a5b4fc;font:600 12px sans-serif;">\u2714 MERGED OUTPUT (' + code.split('\n').length + ' lines)</span>';
 
+    var btnWrap = document.createElement('div');
+    btnWrap.style.cssText = 'display:flex;gap:6px;';
+
     var copyBtn = document.createElement('button');
     copyBtn.textContent = 'Copy All';
     copyBtn.style.cssText = 'padding:4px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font:600 11px sans-serif;cursor:pointer;';
@@ -378,7 +456,19 @@ function injectCodeBlock(code) {
             setTimeout(function() { copyBtn.textContent = 'Copy All'; }, 2000);
         });
     });
-    header.appendChild(copyBtn);
+
+    var dlBtn = document.createElement('button');
+    dlBtn.textContent = 'Download';
+    dlBtn.style.cssText = 'padding:4px 12px;border:none;border-radius:6px;background:#d97706;color:#fff;font:600 11px sans-serif;cursor:pointer;';
+    dlBtn.addEventListener('click', function() {
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([code], {type: 'text/html'}));
+        a.download = 'output.html'; a.click();
+    });
+
+    btnWrap.appendChild(copyBtn);
+    btnWrap.appendChild(dlBtn);
+    header.appendChild(btnWrap);
 
     var pre = document.createElement('pre');
     pre.style.cssText = 'margin:0;padding:16px;overflow:auto;max-height:500px;background:#0a0a0f;';
@@ -400,12 +490,79 @@ function injectCodeBlock(code) {
     wrapper.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
+// ============================================================
+// HARVEST FUNCTION - Manually collect all code blocks from page
+// Works after reload, manual stop, or any time
+// ============================================================
+
+function harvestAllCode() {
+    var turns = allTurnEls();
+    var allCode = '';
+
+    for (var i = 0; i < turns.length; i++) {
+        var turnCode = getCodeFromTurnEl(turns[i]);
+        if (turnCode && turnCode.trim().length > 0) {
+            // Clean up: remove the marker lines if present in the code
+            var cleaned = turnCode
+                .replace(/^.*CODE STARTS<<<.*$/gm, '')
+                .replace(/^.*CODE ENDS<<<.*$/gm, '')
+                .replace(/^.*>>>CODE STARTS<<<.*$/gm, '')
+                .replace(/^.*>>>CODE ENDS<<<.*$/gm, '')
+                .replace(/^.*>>>FINISHED<<<.*$/gm, '')
+                .replace(/^.*FINISHED<<<.*$/gm, '')
+                .replace(/^html\s*$/gm, '');
+
+            // Remove leading/trailing empty lines from cleaned block
+            cleaned = cleaned.replace(/^\n+/, '').replace(/\n+$/, '');
+
+            if (cleaned.trim().length > 0) {
+                allCode = mergeOverlap(allCode, cleaned);
+            }
+        }
+    }
+
+    // Also unescape backticks
+    allCode = unesc(allCode);
+
+    return allCode.trim();
+}
+
+function doHarvest() {
+    status('\uD83C\uDF3E Harvesting all code blocks...');
+    var code = harvestAllCode();
+
+    if (!code || code.length === 0) {
+        status('\u26A0 No code blocks found on page.');
+        return;
+    }
+
+    accumulated = code;
+    injectCodeBlock(code);
+
+    var panel = $('#acl-panel');
+    if (panel) {
+        panel.querySelector('pre').textContent = code;
+        panel.style.display = 'flex';
+    }
+
+    navigator.clipboard.writeText(code).then(function() {
+        status('\uD83C\uDF3E Harvested! ' + code.split('\n').length + ' lines \u2014 injected & copied.');
+        playSuccessSound();
+    });
+}
+
 function finish() {
     running = false;
     clearWait();
     markDone();
     updateBtn();
     var code = accumulated.trim();
+
+    if (!code || code.length === 0) {
+        // Fallback: try harvesting from DOM
+        code = harvestAllCode();
+        accumulated = code;
+    }
 
     injectCodeBlock(code);
 
@@ -427,8 +584,15 @@ function start(prompt) {
     setTimeout(poll, 5000);
 }
 
-function stop() { running = false; clearWait(); updateBtn(); status('\u23F9 Stopped.'); }
+function stop() {
+    running = false;
+    clearWait();
+    updateBtn();
+    status('\u23F9 Stopped. Use \uD83C\uDF3E Harvest to collect code.');
+}
+
 function status(msg) { var el = $('#acl-status'); if (el) el.textContent = msg; }
+
 function updateBtn() {
     var btn = $('#acl-btn');
     if (!btn) return;
@@ -446,7 +610,10 @@ function initUI() {
         '#acl-btn:hover{transform:scale(1.05);box-shadow:0 6px 20px rgba(124,58,237,.5);}',
         '#acl-btn.acl-on{background:linear-gradient(135deg,#dc2626,#b91c1c);box-shadow:0 4px 15px rgba(220,38,38,.4);animation:acl-p 1.5s infinite}',
         '@keyframes acl-p{0%,100%{opacity:1}50%{opacity:.5}}',
-        '#acl-status{color:#a5b4fc;font-size:11px;min-width:200px;text-shadow:0 0 10px rgba(165,180,252,.3);}',
+        '#acl-status{color:#a5b4fc;font-size:11px;min-width:180px;text-shadow:0 0 10px rgba(165,180,252,.3);}',
+        '#acl-harvest{height:40px;padding:0 16px;border:none;border-radius:10px;cursor:pointer;background:linear-gradient(135deg,#059669,#047857);color:#fff;font:700 13px sans-serif;transition:all .15s;box-shadow:0 4px 15px rgba(5,150,105,.3);white-space:nowrap;}',
+        '#acl-harvest:hover{transform:scale(1.05);box-shadow:0 6px 20px rgba(5,150,105,.4);}',
+        '#acl-harvest:active{transform:scale(.95);}',
         '#acl-counter{display:flex;align-items:center;gap:14px;padding:4px 14px;background:rgba(124,58,237,.08);border:1px solid rgba(139,92,246,.2);border-radius:10px;margin-left:auto;}',
         '#acl-counter-title{font:600 11px sans-serif;color:#c4b5fd;white-space:nowrap;letter-spacing:.3px;}',
         '.acl-counter-badge{display:flex;align-items:center;gap:4px;font:700 14px "SF Mono",monospace;}',
@@ -461,6 +628,9 @@ function initUI() {
         '#acl-skip{padding:13px 30px;border:none;border-radius:12px;cursor:pointer;background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;font:700 15px sans-serif;transition:all .15s;letter-spacing:.5px;box-shadow:0 4px 20px rgba(124,58,237,.4);}',
         '#acl-skip:hover{background:linear-gradient(135deg,#6d28d9,#5b21b6);transform:scale(1.05);box-shadow:0 6px 25px rgba(124,58,237,.5);}',
         '#acl-skip:active{transform:scale(.97);}',
+        '#acl-harvest{height:40px;padding:0 16px;border:none;border-radius:10px;cursor:pointer;background:linear-gradient(135deg,#059669,#047857);color:#fff;font:700 13px sans-serif;transition:all .15s;box-shadow:0 4px 15px rgba(5,150,105,.3);white-space:nowrap;}',
+        '#acl-harvest:hover{transform:scale(1.05);box-shadow:0 6px 20px rgba(5,150,105,.4);}',
+        '#acl-harvest:active{transform:scale(.95);}',
         '#acl-panel{display:none;flex-direction:column;position:fixed;inset:5%;z-index:99999999;background:linear-gradient(180deg,#0a0a0f,#0d0820);border:1px solid rgba(124,58,237,.5);border-radius:16px;overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.8),0 0 40px rgba(124,58,237,.1);}',
         '#acl-panel pre{flex:1;overflow:auto;padding:20px;margin:0;color:#e2e8f0;font:12px/1.6 "SF Mono",monospace;white-space:pre-wrap;}',
         '#acl-panel-bar{display:flex;gap:10px;padding:14px;border-top:1px solid rgba(139,92,246,.2);background:rgba(0,0,0,.3);}',
@@ -473,6 +643,7 @@ function initUI() {
     bar.innerHTML = [
         '<textarea id="acl-input" placeholder="\u2728 Prompt eingeben... (Enter zum Starten)" rows="1"></textarea>',
         '<button id="acl-btn">\u25B6</button>',
+        '<button id="acl-harvest">\uD83C\uDF3E Harvest</button>',
         '<span id="acl-status">\u2728 Ready</span>',
         '<div id="acl-counter">',
         '  <span id="acl-counter-title">\u2728 KI Auto-Coder \u2014 Bereit</span>',
@@ -497,6 +668,7 @@ function initUI() {
         if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); toggle(); }
     });
     $('#acl-btn').addEventListener('click', toggle);
+    $('#acl-harvest').addEventListener('click', doHarvest);
     $('#acl-skip').addEventListener('click', doSkip);
     $('#acl-close').addEventListener('click', function() { panel.style.display = 'none'; });
     $('#acl-copy').addEventListener('click', function() {
@@ -504,11 +676,197 @@ function initUI() {
     });
     $('#acl-dl').addEventListener('click', function() {
         var a = document.createElement('a');
-        a.href = URL.createObjectURL(new Blob([accumulated.trim()]));
+        a.href = URL.createObjectURL(new Blob([accumulated.trim()], {type: 'text/html'}));
         a.download = 'output.html'; a.click();
     });
 
     updateCounter();
+}
+
+// ============================================================
+// HARVEST FUNCTION - Manually collect all code blocks from page
+// Works after reload, manual stop, or any time
+// ============================================================
+
+function allTurnEls() {
+    return document.querySelectorAll('[data-testid^="youchat-answer-turn-"]');
+}
+
+function getCodeFromTurnEl(el) {
+    if (!el) return '';
+    var codeEls = el.querySelectorAll('pre code');
+    if (codeEls.length === 0) return '';
+    var allCode = '';
+    for (var i = 0; i < codeEls.length; i++) {
+        allCode += (allCode ? '\n' : '') + (codeEls[i].textContent || '');
+    }
+    return allCode;
+}
+
+function harvestAllCode() {
+    var turns = allTurnEls();
+    var allCode = '';
+
+    for (var i = 0; i < turns.length; i++) {
+        var turnCode = getCodeFromTurnEl(turns[i]);
+        if (turnCode && turnCode.trim().length > 0) {
+            // Clean up: remove marker lines and language hints
+            var cleaned = turnCode
+                .replace(/^.*CODE STARTS<<<.*$/gm, '')
+                .replace(/^.*CODE ENDS<<<.*$/gm, '')
+                .replace(/^.*>>>CODE STARTS<<<.*$/gm, '')
+                .replace(/^.*>>>CODE ENDS<<<.*$/gm, '')
+                .replace(/^.*>>>FINISHED<<<.*$/gm, '')
+                .replace(/^.*FINISHED<<<.*$/gm, '')
+                .replace(/^html\s*$/gm, '');
+
+            // Remove leading/trailing empty lines
+            cleaned = cleaned.replace(/^\n+/, '').replace(/\n+$/, '');
+
+            if (cleaned.trim().length > 0) {
+                allCode = mergeOverlap(allCode, cleaned);
+            }
+        }
+    }
+
+    // Unescape backticks
+    allCode = unesc(allCode);
+    return allCode.trim();
+}
+
+function doHarvest() {
+    status('\uD83C\uDF3E Harvesting all code blocks...');
+    var code = harvestAllCode();
+
+    if (!code || code.length === 0) {
+        status('\u26A0 No code blocks found on page.');
+        return;
+    }
+
+    accumulated = code;
+    injectCodeBlock(code);
+
+    var panel = $('#acl-panel');
+    if (panel) {
+        panel.querySelector('pre').textContent = code;
+        panel.style.display = 'flex';
+    }
+
+    navigator.clipboard.writeText(code).then(function() {
+        status('\uD83C\uDF3E Harvested! ' + code.split('\n').length + ' lines \u2014 injected & copied.');
+        playSuccessSound();
+    });
+}
+
+// ============================================================
+// IMPROVED MARKER DETECTION
+// The >>> markers get rendered as blockquotes in the DOM.
+// innerText shows "CODE ENDS<<<" without leading >>> 
+// ============================================================
+
+function normalizeMarkerText(text) {
+    // Strip leading > characters and spaces (blockquote artifacts)
+    return text.replace(/^[\s>]+/gm, '');
+}
+
+function isDone(text) {
+    var norm = normalizeMarkerText(text);
+    if (norm.indexOf(FINISH) !== -1) return true;
+    if (norm.indexOf('FINISHED<<<') !== -1) return true;
+    if (norm.indexOf('FINISHED') !== -1 && norm.indexOf('<<<') !== -1) return true;
+    var tail = norm.slice(-300);
+    if (tail.indexOf('CODE ENDS') !== -1 && tail.indexOf('FINISHED') !== -1) return true;
+    // Check DOM spans directly
+    var lastEl = lastTurnEl();
+    if (lastEl) {
+        var spans = lastEl.querySelectorAll('[data-testid="youchat-text"]');
+        for (var i = 0; i < spans.length; i++) {
+            var spanText = spans[i].textContent || '';
+            if (spanText.indexOf('FINISHED') !== -1) return true;
+        }
+    }
+    return false;
+}
+
+function extractCode(text) {
+    var norm = normalizeMarkerText(text);
+    var result = '';
+    var idx = 0;
+    var foundAny = false;
+
+    var altStarts = [CODE_START, 'CODE STARTS<<<'];
+    var altEnds = [CODE_END, 'CODE ENDS<<<'];
+
+    while (true) {
+        var si = -1;
+        var usedStartLen = 0;
+        for (var s = 0; s < altStarts.length; s++) {
+            var found = norm.indexOf(altStarts[s], idx);
+            if (found !== -1 && (si === -1 || found < si)) {
+                si = found;
+                usedStartLen = altStarts[s].length;
+            }
+        }
+        if (si === -1) break;
+        foundAny = true;
+
+        var ei = -1;
+        var usedEndLen = 0;
+        for (var e = 0; e < altEnds.length; e++) {
+            var foundEnd = norm.indexOf(altEnds[e], si + usedStartLen);
+            if (foundEnd !== -1 && (ei === -1 || foundEnd < ei)) {
+                ei = foundEnd;
+                usedEndLen = altEnds[e].length;
+            }
+        }
+
+        var raw;
+        if (ei === -1) {
+            raw = norm.substring(si + usedStartLen);
+            prevHadUnclosedBlock = true;
+        } else {
+            raw = norm.substring(si + usedStartLen, ei);
+            prevHadUnclosedBlock = false;
+        }
+        var code = stripFence(raw);
+        if (code) result += (result ? '\n' : '') + code;
+        if (ei === -1) break;
+        idx = ei + usedEndLen;
+    }
+
+    // Fallback: extract from DOM code blocks directly
+    if (!foundAny) {
+        if (prevHadUnclosedBlock) {
+            var domCode = lastCodeFromDOM();
+            if (domCode) result = domCode;
+        }
+    }
+
+    return unesc(result);
+}
+
+function finish() {
+    running = false;
+    clearWait();
+    markDone();
+    updateBtn();
+    var code = accumulated.trim();
+
+    if (!code || code.length === 0) {
+        // Fallback: try harvesting from DOM
+        code = harvestAllCode();
+        accumulated = code;
+    }
+
+    injectCodeBlock(code);
+
+    var panel = $('#acl-panel');
+    panel.querySelector('pre').textContent = code;
+    panel.style.display = 'flex';
+
+    navigator.clipboard.writeText(code).then(function() {
+        status('\u2705 Done! ' + code.split('\n').length + ' lines \u2014 injected & copied.');
+    });
 }
 
 function toggle() {
