@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Auto-Coder v7
 // @namespace    http://tampermonkey.net/
-// @version      7.0
-// @description  Auto-continue with overlap, skip button, handles duplicate start tags.
+// @version      7.1
+// @description  Auto-continue with overlap, skip button, proper fence handling.
 // @match        https://you.com/*
 // @grant        none
 // ==/UserScript==
@@ -39,14 +39,15 @@ function lastText() {
 }
 
 function lastCodeFromDOM() {
-    // Get the actual code content from the last turn's <pre><code> elements
     var el = lastTurnEl();
     if (!el) return '';
     var codeEls = el.querySelectorAll('pre code');
     if (codeEls.length === 0) return '';
-    // Get the last code element's text
-    var lastCode = codeEls[codeEls.length - 1].textContent || '';
-    return lastCode;
+    var allCode = '';
+    for (var i = 0; i < codeEls.length; i++) {
+        allCode += (allCode ? '\n' : '') + (codeEls[i].textContent || '');
+    }
+    return allCode;
 }
 
 function submit(text) {
@@ -64,18 +65,23 @@ function submit(text) {
 function unesc(code) { return code.replace(/>>>BACKTICK<<</g, BT); }
 
 function extractCode(text) {
-    // Extract code between CODE_START and CODE_END markers
     var result = '';
     var idx = 0;
     while (true) {
         var si = text.indexOf(CODE_START, idx);
         if (si === -1) break;
         var ei = text.indexOf(CODE_END, si);
-        var raw = ei === -1 ? text.substring(si + CODE_START.length) : text.substring(si + CODE_START.length, ei);
+        var raw;
+        if (ei === -1) {
+            raw = text.substring(si + CODE_START.length);
+            prevHadUnclosedBlock = true;
+        } else {
+            raw = text.substring(si + CODE_START.length, ei);
+            prevHadUnclosedBlock = false;
+        }
         var code = stripFence(raw);
         if (code) result += (result ? '\n' : '') + code;
-        if (ei === -1) { prevHadUnclosedBlock = true; break; }
-        prevHadUnclosedBlock = false;
+        if (ei === -1) break;
         idx = ei + CODE_END.length;
     }
     return unesc(result);
@@ -91,7 +97,6 @@ function stripFence(block) {
         if (inFence) out.push(l);
     }
     if (out.length === 0) {
-        // No fence found — take everything after the first line (which is usually the name)
         return lines.slice(1).join('\n');
     }
     return out.join('\n');
@@ -114,10 +119,8 @@ function mergeOverlap(existing, fragment) {
 }
 
 function getRawTail() {
-    // Get last 3 meaningful lines from the DOM code element directly
     var code = lastCodeFromDOM();
     if (!code || code.trim().length === 0) {
-        // Fallback: use accumulated
         if (accumulated) {
             var accLines = accumulated.split('\n');
             return accLines.slice(-3).join('\n');
@@ -125,7 +128,6 @@ function getRawTail() {
         return '';
     }
     var lines = code.split('\n');
-    // Walk backwards, skip empty lines
     var meaningful = [];
     for (var i = lines.length - 1; i >= 0; i--) {
         if (lines[i].trim().length > 0 || meaningful.length > 0) {
@@ -134,28 +136,6 @@ function getRawTail() {
         if (meaningful.length >= 3) break;
     }
     return meaningful.join('\n');
-}
-
-function handleDuplicateStartTag(text) {
-    // If previous response had an unclosed block and this one starts with CODE_START,
-    // the AI repeated the start tag. Strip it and treat as continuation.
-    if (prevHadUnclosedBlock) {
-        var trimmed = text.trim();
-        if (trimmed.indexOf(CODE_START) === 0) {
-            // Strip the duplicate start tag — this is just a continuation
-            var afterTag = trimmed.substring(CODE_START.length);
-            // Also strip any name/fence header that might follow
-            var nameMatch = afterTag.match(/^\s*[A-Z0-9_]+\s*\n/);
-            if (nameMatch) afterTag = afterTag.substring(nameMatch[0].length);
-            if (afterTag.trim().indexOf(FENCE) === 0) {
-                var fenceEnd = afterTag.indexOf('\n');
-                if (fenceEnd !== -1) afterTag = afterTag.substring(fenceEnd + 1);
-            }
-            // Now wrap it properly so extractCode works
-            return CODE_START + '\n' + FENCE + '\n' + afterTag;
-        }
-    }
-    return text;
 }
 
 function isDone(text) { return text.indexOf(FINISH) !== -1; }
@@ -172,17 +152,12 @@ function poll() {
 function handleResponse() {
     if (!running) return;
     var text = lastText();
-
-    // Handle duplicate start tags from continuation
-    text = handleDuplicateStartTag(text);
-
     var newCode = extractCode(text);
 
     if (newCode) {
         accumulated = mergeOverlap(accumulated, newCode);
     }
 
-    // Always update raw tail from DOM
     lastRawTail = getRawTail();
 
     if (isDone(text) || continues >= MAX) { finish(); }
@@ -195,14 +170,11 @@ function scheduleNext() {
     showWait(DELAY_MS);
 }
 
-function doSkip() {
-    clearWait();
-    doSubmitContinue();
-}
+function doSkip() { clearWait(); doSubmitContinue(); }
 
 function doSubmitContinue() {
     if (!running) return;
-    status('Submitting continue (' + continues + '/' + MAX + ')...');
+    status('Continuing (' + continues + '/' + MAX + ')...');
     submit(buildContinue());
     setTimeout(poll, 4000);
 }
@@ -237,7 +209,6 @@ function updateWaitUI() {
 
 function buildContinue() {
     var tail = lastRawTail;
-    // If tail is still empty, try from accumulated
     if (!tail || tail.trim().length === 0) {
         var accLines = accumulated.split('\n');
         tail = accLines.slice(-3).join('\n');
@@ -249,16 +220,18 @@ function buildContinue() {
     lines.push(tail);
     lines.push(FENCE);
     lines.push('');
-    lines.push('Start by repeating those last 2 lines for overlap, then continue.');
+    lines.push('Your response MUST start with exactly these two lines:');
+    lines.push(CODE_START);
+    lines.push(FENCE + 'html');
     lines.push('');
-    lines.push('IMPORTANT:');
-    lines.push('- Do NOT write ' + CODE_START + ' again — you are already inside a code block.');
-    lines.push('- Just write the code directly.');
-    lines.push('- When the entire file is complete, close with:');
-    lines.push('  ' + FENCE);
-    lines.push('  ' + CODE_END);
-    lines.push('  ' + FINISH);
+    lines.push('Then repeat those last 2 lines for overlap, then continue the code.');
+    lines.push('');
+    lines.push('RULES:');
+    lines.push('- First line of response: ' + CODE_START);
+    lines.push('- Second line of response: ' + FENCE + 'html');
+    lines.push('- Then the code continues');
     lines.push('- Replace all backticks in code with ' + BACKTICK_ESC);
+    lines.push('- When 100% done, close with ' + FENCE + ' then ' + CODE_END + ' then ' + FINISH);
     return lines.join('\n');
 }
 
@@ -276,7 +249,6 @@ function buildInitial(userText) {
     lines.push('2. Replace EVERY backtick inside your code with: ' + BACKTICK_ESC);
     lines.push('3. When completely finished, write on its own line: ' + FINISH);
     lines.push('4. If response gets long, just stop mid-code. I will say continue.');
-    lines.push('5. On continue, do NOT repeat ' + CODE_START + '. Just continue the code.');
     lines.push('==================');
     return lines.join('\n');
 }
@@ -313,23 +285,25 @@ function updateBtn() {
 
 function initUI() {
     var s = document.createElement('style');
-    s.textContent = '#acl-bar{position:fixed;bottom:0;left:0;right:0;z-index:9999999;display:flex;align-items:center;background:#0a0814;border-top:1px solid rgba(139,92,246,.3);padding:6px 10px;gap:8px;font:13px "SF Mono",monospace;}' +
-        '#acl-input{flex:1;background:#1a1528;color:#e2e8f0;border:1px solid #333;border-radius:6px;padding:10px 14px;font:inherit;resize:none;min-height:38px;max-height:150px;}' +
-        '#acl-btn{width:44px;height:38px;border:none;border-radius:8px;cursor:pointer;background:#7c3aed;color:#fff;font-size:18px;}' +
-        '#acl-btn.acl-on{background:#dc2626;animation:acl-p 1s infinite}' +
-        '@keyframes acl-p{50%{opacity:.5}}' +
-        '#acl-status{color:#a5b4fc;font-size:11px;min-width:200px;}' +
-        '#acl-wait{display:none;position:fixed;bottom:70px;left:50%;transform:translateX(-50%);z-index:9999999;align-items:center;gap:14px;background:#0f0b1e;border:1px solid rgba(139,92,246,.4);border-radius:14px;padding:14px 24px;box-shadow:0 10px 40px rgba(0,0,0,.6);}' +
-        '#acl-wait-time{font:700 32px "SF Mono",monospace;color:#c4b5fd;min-width:55px;text-align:center;}' +
-        '#acl-wait-track{width:140px;height:6px;background:rgba(139,92,246,.15);border-radius:3px;overflow:hidden;}' +
-        '#acl-wait-bar{height:100%;width:0%;background:linear-gradient(90deg,#7c3aed,#a855f7);border-radius:3px;transition:width 1s linear;}' +
-        '#acl-skip{padding:12px 28px;border:none;border-radius:10px;cursor:pointer;background:#7c3aed;color:#fff;font:700 15px sans-serif;transition:all .15s;letter-spacing:.5px;}' +
-        '#acl-skip:hover{background:#6d28d9;transform:scale(1.05);}' +
-        '#acl-skip:active{transform:scale(.97);}' +
-        '#acl-panel{display:none;flex-direction:column;position:fixed;inset:5%;z-index:99999999;background:#0a0a0f;border:1px solid #7c3aed;border-radius:12px;overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.7);}' +
-        '#acl-panel pre{flex:1;overflow:auto;padding:16px;margin:0;color:#e2e8f0;font:12px/1.6 "SF Mono",monospace;white-space:pre-wrap;}' +
-        '#acl-panel-bar{display:flex;gap:8px;padding:12px;border-top:1px solid #333;}' +
-        '#acl-panel-bar button{padding:8px 16px;border:none;border-radius:8px;cursor:pointer;font:600 12px sans-serif;}';
+    s.textContent = [
+        '#acl-bar{position:fixed;bottom:0;left:0;right:0;z-index:9999999;display:flex;align-items:center;background:#0a0814;border-top:1px solid rgba(139,92,246,.3);padding:6px 10px;gap:8px;font:13px "SF Mono",monospace;}',
+        '#acl-input{flex:1;background:#1a1528;color:#e2e8f0;border:1px solid #333;border-radius:6px;padding:10px 14px;font:inherit;resize:none;min-height:38px;max-height:150px;}',
+        '#acl-btn{width:44px;height:38px;border:none;border-radius:8px;cursor:pointer;background:#7c3aed;color:#fff;font-size:18px;}',
+        '#acl-btn.acl-on{background:#dc2626;animation:acl-p 1s infinite}',
+        '@keyframes acl-p{50%{opacity:.5}}',
+        '#acl-status{color:#a5b4fc;font-size:11px;min-width:200px;}',
+        '#acl-wait{display:none;position:fixed;bottom:70px;left:50%;transform:translateX(-50%);z-index:9999999;align-items:center;gap:14px;background:#0f0b1e;border:1px solid rgba(139,92,246,.4);border-radius:14px;padding:14px 24px;box-shadow:0 10px 40px rgba(0,0,0,.6);}',
+        '#acl-wait-time{font:700 32px "SF Mono",monospace;color:#c4b5fd;min-width:55px;text-align:center;}',
+        '#acl-wait-track{width:140px;height:6px;background:rgba(139,92,246,.15);border-radius:3px;overflow:hidden;}',
+        '#acl-wait-bar{height:100%;width:0%;background:linear-gradient(90deg,#7c3aed,#a855f7);border-radius:3px;transition:width 1s linear;}',
+        '#acl-skip{padding:12px 28px;border:none;border-radius:10px;cursor:pointer;background:#7c3aed;color:#fff;font:700 15px sans-serif;transition:all .15s;letter-spacing:.5px;}',
+        '#acl-skip:hover{background:#6d28d9;transform:scale(1.05);}',
+        '#acl-skip:active{transform:scale(.97);}',
+        '#acl-panel{display:none;flex-direction:column;position:fixed;inset:5%;z-index:99999999;background:#0a0a0f;border:1px solid #7c3aed;border-radius:12px;overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.7);}',
+        '#acl-panel pre{flex:1;overflow:auto;padding:16px;margin:0;color:#e2e8f0;font:12px/1.6 "SF Mono",monospace;white-space:pre-wrap;}',
+        '#acl-panel-bar{display:flex;gap:8px;padding:12px;border-top:1px solid #333;}',
+        '#acl-panel-bar button{padding:8px 16px;border:none;border-radius:8px;cursor:pointer;font:600 12px sans-serif;}'
+    ].join('\n');
     document.head.appendChild(s);
 
     var bar = document.createElement('div'); bar.id = 'acl-bar';
