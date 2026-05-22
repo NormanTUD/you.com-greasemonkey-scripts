@@ -2,7 +2,7 @@
 // @name         Auto-Coder v7
 // @namespace    http://tampermonkey.net/
 // @version      7.0
-// @description  Minimal auto-continue with proper overlap detection & reliable finish.
+// @description  Auto-continue with overlap. Uses >>>CODE STARTS<<< / >>>CODE ENDS<<<.
 // @match        https://you.com/*
 // @grant        none
 // ==/UserScript==
@@ -12,20 +12,25 @@
 
 var BT = String.fromCharCode(96);
 var FENCE = BT + BT + BT;
-var DONE = '///DONE';
-var POLL_MS = 2500;
+var FINISH = '>>>FINISHED<<<';
+var CODE_START = '>>>CODE STARTS<<<';
+var CODE_END = '>>>CODE ENDS<<<';
+var BACKTICK_ESC = '>>>BACKTICK<<<';
 var DELAY_MS = 25000;
 var MAX = 15;
+var POLL_MS = 2500;
 
-var running = false, continues = 0, lastTurns = 0, codeBlocks = [];
+var running = false, continues = 0, lastTurns = 0;
+var codeParts = [], lastTail = '';
 
 var $ = function(s) { return document.querySelector(s); };
 var getTurns = function() { return document.querySelectorAll('[data-testid^="youchat-answer-turn-"]').length; };
-var lastText = function() {
+var isGen = function() { return document.querySelectorAll('[data-testid^="step-"][data-finished="false"]').length > 0; };
+
+function lastText() {
     var all = document.querySelectorAll('[data-testid^="youchat-answer-turn-"]');
     return all.length ? all[all.length - 1].innerText : '';
-};
-var isGen = function() { return document.querySelectorAll('[data-testid^="step-"][data-finished="false"]').length > 0; };
+}
 
 function submit(text) {
     var ta = $('#search-input-textarea');
@@ -39,20 +44,40 @@ function submit(text) {
     }, 300);
 }
 
-function extractFences(text) {
+function unesc(code) {
+    return code.replace(/>>>BACKTICK<<</g, BT);
+}
+
+function extractBlocks(text) {
     var blocks = [];
-    var re = new RegExp(FENCE + '[\\w]*\\n([\\s\\S]*?)' + FENCE, 'g');
-    var m;
-    while ((m = re.exec(text)) !== null) blocks.push(m[1]);
+    var idx = 0;
+    while (true) {
+        var si = text.indexOf(CODE_START, idx);
+        if (si === -1) break;
+        var ei = text.indexOf(CODE_END, si);
+        var raw = ei === -1 ? text.substring(si + CODE_START.length) : text.substring(si + CODE_START.length, ei);
+        var code = extractFromFence(raw);
+        if (code) blocks.push(unesc(code));
+        if (ei === -1) break;
+        idx = ei + CODE_END.length;
+    }
     return blocks;
 }
 
-function getLastCodeTail(text) {
-    var blocks = extractFences(text);
-    if (blocks.length === 0) return '';
-    var last = blocks[blocks.length - 1];
-    var lines = last.split('\n');
-    return lines.slice(-8).join('\n');
+function extractFromFence(block) {
+    var lines = block.split('\n');
+    var inFence = false, out = [];
+    for (var i = 0; i < lines.length; i++) {
+        var l = lines[i];
+        if (!inFence && l.trim().indexOf(FENCE) === 0) { inFence = true; continue; }
+        if (inFence && l.trim() === FENCE) { inFence = false; continue; }
+        if (inFence) out.push(l);
+    }
+    if (out.length === 0) {
+        var filtered = lines.slice(1).filter(function(l) { return l.trim().length > 0; });
+        return filtered.join('\n');
+    }
+    return out.join('\n');
 }
 
 function mergeOverlap(existing, fragment) {
@@ -60,29 +85,24 @@ function mergeOverlap(existing, fragment) {
     if (!fragment) return existing;
     var aL = existing.split('\n');
     var bL = fragment.split('\n');
-    var maxCheck = Math.min(aL.length, bL.length, 20);
+    var maxCheck = Math.min(aL.length, bL.length, 25);
     var best = 0;
     for (var n = 1; n <= maxCheck; n++) {
         var tail = aL.slice(-n).map(function(l) { return l.trim(); }).join('\n');
         var head = bL.slice(0, n).map(function(l) { return l.trim(); }).join('\n');
         if (tail === head) best = n;
     }
-    if (best > 0) {
-        return existing + '\n' + bL.slice(best).join('\n');
-    }
+    if (best > 0) return existing + '\n' + bL.slice(best).join('\n');
     return existing + '\n' + fragment;
 }
 
 function isDone(text) {
-    if (text.indexOf(DONE) !== -1) return true;
-    var fenceCount = text.split(FENCE).length - 1;
-    if (fenceCount % 2 !== 0) return false;
-    var tail = text.slice(-300);
-    if (/\b(continue|next part|I'll continue|let me continue)\b/i.test(tail)) return false;
-    var trimmed = text.trimEnd();
-    var lastLine = trimmed.split('\n').pop().trim();
-    if (/[.;}\])\x60"']$/.test(lastLine) && fenceCount > 0) return true;
+    if (text.indexOf(FINISH) !== -1) return true;
     return false;
+}
+
+function getAccumulated() {
+    return codeParts.join('\n');
 }
 
 function poll() {
@@ -91,64 +111,91 @@ function poll() {
     var t = getTurns();
     if (t <= lastTurns) { setTimeout(poll, POLL_MS); return; }
     lastTurns = t;
-    setTimeout(handleResponse, 1500);
+    setTimeout(handleResponse, 2000);
 }
 
 function handleResponse() {
     if (!running) return;
     var text = lastText();
-    var blocks = extractFences(text);
+    var blocks = extractBlocks(text);
 
-    // Merge each block with overlap detection against accumulated code
     for (var i = 0; i < blocks.length; i++) {
-        if (codeBlocks.length === 0) {
-            codeBlocks.push(blocks[i]);
+        if (codeParts.length === 0) {
+            codeParts.push(blocks[i]);
         } else {
-            var lastIdx = codeBlocks.length - 1;
-            var merged = mergeOverlap(codeBlocks[lastIdx], blocks[i]);
-            // If overlap found, merge into last block; otherwise push new
-            if (merged.length < codeBlocks[lastIdx].length + blocks[i].length + 5) {
-                codeBlocks[lastIdx] = merged;
-            } else {
-                codeBlocks.push(blocks[i]);
-            }
+            var lastIdx = codeParts.length - 1;
+            codeParts[lastIdx] = mergeOverlap(codeParts[lastIdx], blocks[i]);
         }
     }
+
+    // Save tail for continue prompt
+    var accumulated = getAccumulated();
+    var accLines = accumulated.split('\n');
+    lastTail = accLines.slice(-10).join('\n');
 
     if (isDone(text) || continues >= MAX) {
         finish();
     } else {
         continues++;
         status('Continuing (' + continues + '/' + MAX + ')...');
-        var tail = getLastCodeTail(text);
         setTimeout(function() {
             if (!running) return;
-            var prompt = 'Continue EXACTLY where you left off.';
-            if (tail) {
-                prompt += ' The last lines you wrote were:\n' + FENCE + '\n' + tail + '\n' + FENCE + '\n';
-                prompt += 'Resume from the very next line after those.';
-            }
-            prompt += '\nWhen completely finished, write ' + DONE + ' on its own line.';
-            submit(prompt);
+            submit(buildContinue());
             setTimeout(poll, 4000);
         }, DELAY_MS);
     }
 }
 
+function buildContinue() {
+    var lines = [];
+    lines.push('Continue EXACTLY where you left off. Here are the last lines you wrote:');
+    lines.push('');
+    lines.push(FENCE);
+    lines.push(lastTail);
+    lines.push(FENCE);
+    lines.push('');
+    lines.push('Resume from the VERY NEXT LINE. Do NOT repeat those lines.');
+    lines.push('');
+    lines.push('RULES (same as before):');
+    lines.push('- Wrap code in ' + CODE_START + ' and ' + CODE_END);
+    lines.push('- Replace all backticks with ' + BACKTICK_ESC);
+    lines.push('- When 100% done: ' + FINISH);
+    return lines.join('\n');
+}
+
+function buildInitial(userText) {
+    var lines = [];
+    lines.push(userText);
+    lines.push('');
+    lines.push('=== OUTPUT RULES ===');
+    lines.push('1. Wrap ALL code between these markers (on their own lines):');
+    lines.push('   ' + CODE_START);
+    lines.push('   ' + FENCE + 'html');
+    lines.push('   ...your code...');
+    lines.push('   ' + FENCE);
+    lines.push('   ' + CODE_END);
+    lines.push('2. Replace EVERY backtick inside your code with: ' + BACKTICK_ESC);
+    lines.push('3. When completely finished, write: ' + FINISH);
+    lines.push('4. If response gets long, just stop. I will say continue.');
+    lines.push('5. Keep functions short (~10 lines max).');
+    lines.push('==================');
+    return lines.join('\n');
+}
+
 function finish() {
     running = false;
     updateBtn();
-    var code = codeBlocks.join('\n\n').trim();
+    var code = getAccumulated().trim();
     var panel = $('#acl-panel');
     panel.querySelector('pre').textContent = code;
     panel.style.display = 'flex';
-    navigator.clipboard.writeText(code).then(function() { status('Done & copied!'); });
+    navigator.clipboard.writeText(code).then(function() { status('Done & copied! (' + code.split('\n').length + ' lines)'); });
 }
 
 function start(prompt) {
-    running = true; continues = 0; codeBlocks = []; lastTurns = getTurns();
+    running = true; continues = 0; codeParts = []; lastTail = ''; lastTurns = getTurns();
     updateBtn(); status('Submitting...');
-    submit(prompt + '\n\nWhen completely finished, write "' + DONE + '" on its own line.');
+    submit(buildInitial(prompt));
     setTimeout(poll, 5000);
 }
 
@@ -189,14 +236,12 @@ function initUI() {
     $('#acl-btn').addEventListener('click', toggle);
     $('#acl-close').addEventListener('click', function() { panel.style.display = 'none'; });
     $('#acl-copy').addEventListener('click', function() {
-        var code = codeBlocks.join('\n\n').trim();
-        navigator.clipboard.writeText(code).then(function() { status('Copied!'); });
+        navigator.clipboard.writeText(getAccumulated().trim()).then(function() { status('Copied!'); });
     });
     $('#acl-dl').addEventListener('click', function() {
-        var code = codeBlocks.join('\n\n').trim();
         var a = document.createElement('a');
-        a.href = URL.createObjectURL(new Blob([code]));
-        a.download = 'output.txt'; a.click();
+        a.href = URL.createObjectURL(new Blob([getAccumulated().trim()]));
+        a.download = 'output.html'; a.click();
     });
 }
 
