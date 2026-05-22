@@ -2,7 +2,7 @@
 // @name         Auto-Coder v7
 // @namespace    http://tampermonkey.net/
 // @version      7.0
-// @description  Auto-continue with overlap, timer + skip, >>>CODE STARTS<<< markers.
+// @description  Auto-continue with overlap, skip button, handles duplicate start tags.
 // @match        https://you.com/*
 // @grant        none
 // ==/UserScript==
@@ -21,15 +21,32 @@ var MAX = 15;
 var POLL_MS = 2500;
 
 var running = false, continues = 0, lastTurns = 0;
-var codeParts = [], lastTail = '', lastRawTail = '', waitTimer = null, waitRemaining = 0;
+var accumulated = '', lastRawTail = '', prevHadUnclosedBlock = false;
+var waitTimer = null, waitRemaining = 0;
 
 var $ = function(s) { return document.querySelector(s); };
 var getTurns = function() { return document.querySelectorAll('[data-testid^="youchat-answer-turn-"]').length; };
 var isGen = function() { return document.querySelectorAll('[data-testid^="step-"][data-finished="false"]').length > 0; };
 
-function lastText() {
+function lastTurnEl() {
     var all = document.querySelectorAll('[data-testid^="youchat-answer-turn-"]');
-    return all.length ? all[all.length - 1].innerText : '';
+    return all.length ? all[all.length - 1] : null;
+}
+
+function lastText() {
+    var el = lastTurnEl();
+    return el ? el.innerText : '';
+}
+
+function lastCodeFromDOM() {
+    // Get the actual code content from the last turn's <pre><code> elements
+    var el = lastTurnEl();
+    if (!el) return '';
+    var codeEls = el.querySelectorAll('pre code');
+    if (codeEls.length === 0) return '';
+    // Get the last code element's text
+    var lastCode = codeEls[codeEls.length - 1].textContent || '';
+    return lastCode;
 }
 
 function submit(text) {
@@ -46,23 +63,25 @@ function submit(text) {
 
 function unesc(code) { return code.replace(/>>>BACKTICK<<</g, BT); }
 
-function extractBlocks(text) {
-    var blocks = [];
+function extractCode(text) {
+    // Extract code between CODE_START and CODE_END markers
+    var result = '';
     var idx = 0;
     while (true) {
         var si = text.indexOf(CODE_START, idx);
         if (si === -1) break;
         var ei = text.indexOf(CODE_END, si);
         var raw = ei === -1 ? text.substring(si + CODE_START.length) : text.substring(si + CODE_START.length, ei);
-        var code = extractFromFence(raw);
-        if (code) blocks.push(unesc(code));
-        if (ei === -1) break;
+        var code = stripFence(raw);
+        if (code) result += (result ? '\n' : '') + code;
+        if (ei === -1) { prevHadUnclosedBlock = true; break; }
+        prevHadUnclosedBlock = false;
         idx = ei + CODE_END.length;
     }
-    return blocks;
+    return unesc(result);
 }
 
-function extractFromFence(block) {
+function stripFence(block) {
     var lines = block.split('\n');
     var inFence = false, out = [];
     for (var i = 0; i < lines.length; i++) {
@@ -72,7 +91,8 @@ function extractFromFence(block) {
         if (inFence) out.push(l);
     }
     if (out.length === 0) {
-        return lines.slice(1).filter(function(l) { return l.trim().length > 0; }).join('\n');
+        // No fence found — take everything after the first line (which is usually the name)
+        return lines.slice(1).join('\n');
     }
     return out.join('\n');
 }
@@ -93,25 +113,52 @@ function mergeOverlap(existing, fragment) {
     return existing + '\n' + fragment;
 }
 
-function isDone(text) { return text.indexOf(FINISH) !== -1; }
-
-function getAccumulated() { return codeParts.join('\n'); }
-
-function getRawTail(text) {
-    // Get the last meaningful lines from the raw response, regardless of markers.
-    // We want: 2 fully complete lines + the (possibly incomplete) last line.
-    var lines = text.split('\n');
-    // Walk backwards to find last non-empty, non-marker lines
+function getRawTail() {
+    // Get last 3 meaningful lines from the DOM code element directly
+    var code = lastCodeFromDOM();
+    if (!code || code.trim().length === 0) {
+        // Fallback: use accumulated
+        if (accumulated) {
+            var accLines = accumulated.split('\n');
+            return accLines.slice(-3).join('\n');
+        }
+        return '';
+    }
+    var lines = code.split('\n');
+    // Walk backwards, skip empty lines
     var meaningful = [];
     for (var i = lines.length - 1; i >= 0; i--) {
-        var l = lines[i].trim();
-        if (l === '' || l === FENCE || l === CODE_END || l === CODE_START || l === FINISH) continue;
-        if (l.indexOf('>>>') === 0) continue;
-        meaningful.unshift(lines[i]);
+        if (lines[i].trim().length > 0 || meaningful.length > 0) {
+            meaningful.unshift(lines[i]);
+        }
         if (meaningful.length >= 3) break;
     }
     return meaningful.join('\n');
 }
+
+function handleDuplicateStartTag(text) {
+    // If previous response had an unclosed block and this one starts with CODE_START,
+    // the AI repeated the start tag. Strip it and treat as continuation.
+    if (prevHadUnclosedBlock) {
+        var trimmed = text.trim();
+        if (trimmed.indexOf(CODE_START) === 0) {
+            // Strip the duplicate start tag — this is just a continuation
+            var afterTag = trimmed.substring(CODE_START.length);
+            // Also strip any name/fence header that might follow
+            var nameMatch = afterTag.match(/^\s*[A-Z0-9_]+\s*\n/);
+            if (nameMatch) afterTag = afterTag.substring(nameMatch[0].length);
+            if (afterTag.trim().indexOf(FENCE) === 0) {
+                var fenceEnd = afterTag.indexOf('\n');
+                if (fenceEnd !== -1) afterTag = afterTag.substring(fenceEnd + 1);
+            }
+            // Now wrap it properly so extractCode works
+            return CODE_START + '\n' + FENCE + '\n' + afterTag;
+        }
+    }
+    return text;
+}
+
+function isDone(text) { return text.indexOf(FINISH) !== -1; }
 
 function poll() {
     if (!running) return;
@@ -125,22 +172,18 @@ function poll() {
 function handleResponse() {
     if (!running) return;
     var text = lastText();
-    var blocks = extractBlocks(text);
 
-    for (var i = 0; i < blocks.length; i++) {
-        if (codeParts.length === 0) codeParts.push(blocks[i]);
-        else codeParts[codeParts.length - 1] = mergeOverlap(codeParts[codeParts.length - 1], blocks[i]);
+    // Handle duplicate start tags from continuation
+    text = handleDuplicateStartTag(text);
+
+    var newCode = extractCode(text);
+
+    if (newCode) {
+        accumulated = mergeOverlap(accumulated, newCode);
     }
 
-    // Always grab the raw tail from the response for the continue prompt
-    lastRawTail = getRawTail(text);
-
-    // Also get tail from accumulated code as fallback
-    var accumulated = getAccumulated();
-    if (accumulated) {
-        var accLines = accumulated.split('\n');
-        lastTail = accLines.slice(-10).join('\n');
-    }
+    // Always update raw tail from DOM
+    lastRawTail = getRawTail();
 
     if (isDone(text) || continues >= MAX) { finish(); }
     else { scheduleNext(); }
@@ -172,10 +215,7 @@ function showWait(ms) {
     waitTimer = setInterval(function() {
         waitRemaining--;
         updateWaitUI();
-        if (waitRemaining <= 0) {
-            clearWait();
-            doSubmitContinue();
-        }
+        if (waitRemaining <= 0) { clearWait(); doSubmitContinue(); }
     }, 1000);
 }
 
@@ -196,9 +236,12 @@ function updateWaitUI() {
 }
 
 function buildContinue() {
-    // Use raw tail (last 2 complete lines + incomplete last line from the actual response)
-    // This ensures the AI sees exactly what it last wrote, even if extraction failed
-    var tail = lastRawTail || lastTail;
+    var tail = lastRawTail;
+    // If tail is still empty, try from accumulated
+    if (!tail || tail.trim().length === 0) {
+        var accLines = accumulated.split('\n');
+        tail = accLines.slice(-3).join('\n');
+    }
     var lines = [];
     lines.push('Continue EXACTLY where you left off. Here are the last lines you wrote:');
     lines.push('');
@@ -206,12 +249,16 @@ function buildContinue() {
     lines.push(tail);
     lines.push(FENCE);
     lines.push('');
-    lines.push('Repeat those last 2 complete lines for overlap, then continue from there.');
+    lines.push('Start by repeating those last 2 lines for overlap, then continue.');
     lines.push('');
-    lines.push('RULES:');
-    lines.push('- Wrap code in ' + CODE_START + ' and ' + CODE_END);
-    lines.push('- Replace all backticks with ' + BACKTICK_ESC);
-    lines.push('- When 100% done: ' + FINISH);
+    lines.push('IMPORTANT:');
+    lines.push('- Do NOT write ' + CODE_START + ' again — you are already inside a code block.');
+    lines.push('- Just write the code directly.');
+    lines.push('- When the entire file is complete, close with:');
+    lines.push('  ' + FENCE);
+    lines.push('  ' + CODE_END);
+    lines.push('  ' + FINISH);
+    lines.push('- Replace all backticks in code with ' + BACKTICK_ESC);
     return lines.join('\n');
 }
 
@@ -229,7 +276,7 @@ function buildInitial(userText) {
     lines.push('2. Replace EVERY backtick inside your code with: ' + BACKTICK_ESC);
     lines.push('3. When completely finished, write on its own line: ' + FINISH);
     lines.push('4. If response gets long, just stop mid-code. I will say continue.');
-    lines.push('5. Keep functions short (~10 lines max).');
+    lines.push('5. On continue, do NOT repeat ' + CODE_START + '. Just continue the code.');
     lines.push('==================');
     return lines.join('\n');
 }
@@ -238,7 +285,7 @@ function finish() {
     running = false;
     clearWait();
     updateBtn();
-    var code = getAccumulated().trim();
+    var code = accumulated.trim();
     var panel = $('#acl-panel');
     panel.querySelector('pre').textContent = code;
     panel.style.display = 'flex';
@@ -248,7 +295,8 @@ function finish() {
 }
 
 function start(prompt) {
-    running = true; continues = 0; codeParts = []; lastTail = ''; lastRawTail = ''; lastTurns = getTurns();
+    running = true; continues = 0; accumulated = ''; lastRawTail = '';
+    prevHadUnclosedBlock = false; lastTurns = getTurns();
     updateBtn(); status('Submitting...');
     submit(buildInitial(prompt));
     setTimeout(poll, 5000);
@@ -303,11 +351,11 @@ function initUI() {
     $('#acl-skip').addEventListener('click', doSkip);
     $('#acl-close').addEventListener('click', function() { panel.style.display = 'none'; });
     $('#acl-copy').addEventListener('click', function() {
-        navigator.clipboard.writeText(getAccumulated().trim()).then(function() { status('Copied!'); });
+        navigator.clipboard.writeText(accumulated.trim()).then(function() { status('Copied!'); });
     });
     $('#acl-dl').addEventListener('click', function() {
         var a = document.createElement('a');
-        a.href = URL.createObjectURL(new Blob([getAccumulated().trim()]));
+        a.href = URL.createObjectURL(new Blob([accumulated.trim()]));
         a.download = 'output.html'; a.click();
     });
 }
