@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Auto-Coder v7
 // @namespace    http://tampermonkey.net/
-// @version      7.1
-// @description  Auto-continue with overlap, skip button, proper fence handling.
+// @version      7.2
+// @description  Auto-continue with overlap, skip button, injects final code block into page.
 // @match        https://you.com/*
 // @grant        none
 // ==/UserScript==
@@ -30,7 +30,8 @@ var isGen = function() { return document.querySelectorAll('[data-testid^="step-"
 
 function lastTurnEl() {
     var all = document.querySelectorAll('[data-testid^="youchat-answer-turn-"]');
-    return all.length ? all[all.length - 1] : null;
+    if (!all.length) return null;
+    return all[all.length - 1];
 }
 
 function lastText() {
@@ -67,9 +68,11 @@ function unesc(code) { return code.replace(/>>>BACKTICK<<</g, BT); }
 function extractCode(text) {
     var result = '';
     var idx = 0;
+    var foundAny = false;
     while (true) {
         var si = text.indexOf(CODE_START, idx);
         if (si === -1) break;
+        foundAny = true;
         var ei = text.indexOf(CODE_END, si);
         var raw;
         if (ei === -1) {
@@ -84,6 +87,11 @@ function extractCode(text) {
         if (ei === -1) break;
         idx = ei + CODE_END.length;
     }
+    // Fallback: if no CODE_START found but prev was unclosed, grab from DOM directly
+    if (!foundAny && prevHadUnclosedBlock) {
+        var domCode = lastCodeFromDOM();
+        if (domCode) result = domCode;
+    }
     return unesc(result);
 }
 
@@ -97,7 +105,10 @@ function stripFence(block) {
         if (inFence) out.push(l);
     }
     if (out.length === 0) {
-        return lines.slice(1).join('\n');
+        // No fence markers found — return everything after first line (name/label)
+        var start = 0;
+        if (lines.length > 0 && /^\s*$/.test(lines[0])) start = 1;
+        return lines.slice(start).join('\n');
     }
     return out.join('\n');
 }
@@ -138,7 +149,16 @@ function getRawTail() {
     return meaningful.join('\n');
 }
 
-function isDone(text) { return text.indexOf(FINISH) !== -1; }
+function isDone(text) {
+    // Check for FINISHED marker — be flexible with whitespace and surrounding markers
+    if (text.indexOf(FINISH) !== -1) return true;
+    // Also check if CODE_END appears near the end (within last 200 chars)
+    var tail = text.slice(-200);
+    if (tail.indexOf(CODE_END) !== -1 && tail.indexOf(FINISH) !== -1) return true;
+    // Check for partial markers that innerText might mangle
+    if (tail.indexOf('FINISHED') !== -1 && tail.indexOf('>>>') !== -1) return true;
+    return false;
+}
 
 function poll() {
     if (!running) return;
@@ -227,11 +247,13 @@ function buildContinue() {
     lines.push('Then repeat those last 2 lines for overlap, then continue the code.');
     lines.push('');
     lines.push('RULES:');
-    lines.push('- First line of response: ' + CODE_START);
-    lines.push('- Second line of response: ' + FENCE + 'html');
-    lines.push('- Then the code continues');
+    lines.push('- First line: ' + CODE_START);
+    lines.push('- Second line: ' + FENCE + 'html');
+    lines.push('- Then code (repeat last 2 lines for overlap, then new code)');
     lines.push('- Replace all backticks in code with ' + BACKTICK_ESC);
-    lines.push('- When 100% done, close with ' + FENCE + ' then ' + CODE_END + ' then ' + FINISH);
+    lines.push('- When 100% done close with: ' + FENCE);
+    lines.push('  Then: ' + CODE_END);
+    lines.push('  Then: ' + FINISH);
     return lines.join('\n');
 }
 
@@ -253,16 +275,74 @@ function buildInitial(userText) {
     return lines.join('\n');
 }
 
+function injectCodeBlock(code) {
+    // Inject a single merged code block into the page after the last turn,
+    // styled like a normal You.com code block so you can copy it directly
+    var lastTurn = lastTurnEl();
+    if (!lastTurn) return;
+
+    // Remove any previously injected block
+    var old = document.getElementById('acl-injected-block');
+    if (old) old.remove();
+
+    var wrapper = document.createElement('div');
+    wrapper.id = 'acl-injected-block';
+    wrapper.style.cssText = 'margin:16px 0;border:2px solid #7c3aed;border-radius:10px;overflow:hidden;position:relative;';
+
+    var header = document.createElement('div');
+    header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:#1a1528;border-bottom:1px solid #333;';
+    header.innerHTML = '<span style="color:#a5b4fc;font:600 12px sans-serif;">\u2714 MERGED OUTPUT (' + code.split('\n').length + ' lines)</span>';
+
+    var copyBtn = document.createElement('button');
+    copyBtn.textContent = 'Copy All';
+    copyBtn.style.cssText = 'padding:4px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font:600 11px sans-serif;cursor:pointer;';
+    copyBtn.addEventListener('click', function() {
+        navigator.clipboard.writeText(code).then(function() {
+            copyBtn.textContent = 'Copied!';
+            setTimeout(function() { copyBtn.textContent = 'Copy All'; }, 2000);
+        });
+    });
+    header.appendChild(copyBtn);
+
+    var pre = document.createElement('pre');
+    pre.style.cssText = 'margin:0;padding:16px;overflow:auto;max-height:500px;background:#0a0a0f;';
+    var codeEl = document.createElement('code');
+    codeEl.style.cssText = 'white-space:pre-wrap;color:#e2e8f0;font:12px/1.6 "SF Mono",Consolas,monospace;';
+    codeEl.textContent = code;
+    pre.appendChild(codeEl);
+
+    wrapper.appendChild(header);
+    wrapper.appendChild(pre);
+
+    // Insert after the last turn's parent container
+    var container = lastTurn.parentElement;
+    if (container) {
+        container.insertBefore(wrapper, lastTurn.nextSibling);
+    } else {
+        lastTurn.after(wrapper);
+    }
+
+    // Scroll into view
+    wrapper.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
 function finish() {
     running = false;
     clearWait();
     updateBtn();
     var code = accumulated.trim();
+
+    // Inject into page as a code block
+    injectCodeBlock(code);
+
+    // Also show in panel
     var panel = $('#acl-panel');
     panel.querySelector('pre').textContent = code;
     panel.style.display = 'flex';
+
+    // Auto-copy
     navigator.clipboard.writeText(code).then(function() {
-        status('Done! ' + code.split('\n').length + ' lines copied.');
+        status('Done! ' + code.split('\n').length + ' lines — injected & copied.');
     });
 }
 
