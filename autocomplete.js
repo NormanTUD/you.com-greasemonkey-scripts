@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Auto-Coder v7
 // @namespace    http://tampermonkey.net/
-// @version      7.2
-// @description  Auto-continue with overlap, skip button, injects final code block into page.
+// @version      7.3
+// @description  Auto-continue with overlap, skip button, injects final code block into page. Now with generation counter & dynamic title.
 // @match        https://you.com/*
 // @grant        none
 // ==/UserScript==
@@ -24,9 +24,92 @@ var running = false, continues = 0, lastTurns = 0;
 var accumulated = '', lastRawTail = '', prevHadUnclosedBlock = false;
 var waitTimer = null, waitRemaining = 0;
 
+// Counter state
+var totalGenerations = 0;
+var processingCount = 0;
+var doneCount = 0;
+
 var $ = function(s) { return document.querySelector(s); };
 var getTurns = function() { return document.querySelectorAll('[data-testid^="youchat-answer-turn-"]').length; };
 var isGen = function() { return document.querySelectorAll('[data-testid^="step-"][data-finished="false"]').length > 0; };
+
+function updateTitle() {
+    var title = '';
+    if (totalGenerations === 0) {
+        title = '\u2728 KI Auto-Coder \u2014 Bereit';
+    } else if (totalGenerations < 3) {
+        title = '\u26A1 Auto-Coder \u2014 ' + totalGenerations + ' generiert';
+    } else if (totalGenerations < 7) {
+        title = '\uD83D\uDD25 Auto-Coder \u2014 ' + totalGenerations + ' generiert!';
+    } else if (totalGenerations < 12) {
+        title = '\uD83D\uDE80 Auto-Coder \u2014 ' + totalGenerations + ' generiert!!';
+    } else {
+        title = '\uD83C\uDF1F BEAST MODE \u2014 ' + totalGenerations + ' Generierungen!';
+    }
+    document.title = title;
+    var titleEl = $('#acl-counter-title');
+    if (titleEl) titleEl.textContent = title;
+}
+
+function updateCounter() {
+    var procEl = $('#acl-count-processing');
+    var doneEl = $('#acl-count-done');
+    var totalEl = $('#acl-count-total');
+    if (procEl) procEl.textContent = processingCount;
+    if (doneEl) doneEl.textContent = doneCount;
+    if (totalEl) totalEl.textContent = totalGenerations;
+    updateTitle();
+}
+
+function incrementProcessing() {
+    processingCount++;
+    totalGenerations++;
+    updateCounter();
+    playProcessingSound();
+}
+
+function markDone() {
+    if (processingCount > 0) processingCount--;
+    doneCount++;
+    updateCounter();
+    playSuccessSound();
+}
+
+// === Web Audio API Sounds ===
+var audioCtx = null;
+function getAudioCtx() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    return audioCtx;
+}
+
+function playTone(freq, startTime, duration) {
+    var ctx = getAudioCtx();
+    var osc = ctx.createOscillator();
+    var gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(freq, startTime);
+    gain.gain.setValueAtTime(0.3, startTime);
+    gain.gain.exponentialRampToValueAtTime(0.0001, startTime + duration);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(startTime);
+    osc.stop(startTime + duration);
+}
+
+function playProcessingSound() {
+    var ctx = getAudioCtx();
+    var now = ctx.currentTime;
+    playTone(440, now, 0.2);
+    playTone(554.37, now + 0.1, 0.2);
+}
+
+function playSuccessSound() {
+    var ctx = getAudioCtx();
+    var now = ctx.currentTime;
+    playTone(523.25, now, 0.15);
+    playTone(659.25, now + 0.1, 0.15);
+    playTone(783.99, now + 0.2, 0.3);
+}
 
 function lastTurnEl() {
     var all = document.querySelectorAll('[data-testid^="youchat-answer-turn-"]');
@@ -87,7 +170,6 @@ function extractCode(text) {
         if (ei === -1) break;
         idx = ei + CODE_END.length;
     }
-    // Fallback: if no CODE_START found but prev was unclosed, grab from DOM directly
     if (!foundAny && prevHadUnclosedBlock) {
         var domCode = lastCodeFromDOM();
         if (domCode) result = domCode;
@@ -105,7 +187,6 @@ function stripFence(block) {
         if (inFence) out.push(l);
     }
     if (out.length === 0) {
-        // No fence markers found — return everything after first line (name/label)
         var start = 0;
         if (lines.length > 0 && /^\s*$/.test(lines[0])) start = 1;
         return lines.slice(start).join('\n');
@@ -150,12 +231,9 @@ function getRawTail() {
 }
 
 function isDone(text) {
-    // Check for FINISHED marker — be flexible with whitespace and surrounding markers
     if (text.indexOf(FINISH) !== -1) return true;
-    // Also check if CODE_END appears near the end (within last 200 chars)
     var tail = text.slice(-200);
     if (tail.indexOf(CODE_END) !== -1 && tail.indexOf(FINISH) !== -1) return true;
-    // Check for partial markers that innerText might mangle
     if (tail.indexOf('FINISHED') !== -1 && tail.indexOf('>>>') !== -1) return true;
     return false;
 }
@@ -186,7 +264,8 @@ function handleResponse() {
 
 function scheduleNext() {
     continues++;
-    status('Waiting... (' + continues + '/' + MAX + ')');
+    incrementProcessing();
+    status('\u23F3 Waiting... (' + continues + '/' + MAX + ')');
     showWait(DELAY_MS);
 }
 
@@ -194,7 +273,7 @@ function doSkip() { clearWait(); doSubmitContinue(); }
 
 function doSubmitContinue() {
     if (!running) return;
-    status('Continuing (' + continues + '/' + MAX + ')...');
+    status('\u23F3 Continuing (' + continues + '/' + MAX + ')...');
     submit(buildContinue());
     setTimeout(poll, 4000);
 }
@@ -276,12 +355,9 @@ function buildInitial(userText) {
 }
 
 function injectCodeBlock(code) {
-    // Inject a single merged code block into the page after the last turn,
-    // styled like a normal You.com code block so you can copy it directly
     var lastTurn = lastTurnEl();
     if (!lastTurn) return;
 
-    // Remove any previously injected block
     var old = document.getElementById('acl-injected-block');
     if (old) old.remove();
 
@@ -314,7 +390,6 @@ function injectCodeBlock(code) {
     wrapper.appendChild(header);
     wrapper.appendChild(pre);
 
-    // Insert after the last turn's parent container
     var container = lastTurn.parentElement;
     if (container) {
         container.insertBefore(wrapper, lastTurn.nextSibling);
@@ -322,39 +397,37 @@ function injectCodeBlock(code) {
         lastTurn.after(wrapper);
     }
 
-    // Scroll into view
     wrapper.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
 function finish() {
     running = false;
     clearWait();
+    markDone();
     updateBtn();
     var code = accumulated.trim();
 
-    // Inject into page as a code block
     injectCodeBlock(code);
 
-    // Also show in panel
     var panel = $('#acl-panel');
     panel.querySelector('pre').textContent = code;
     panel.style.display = 'flex';
 
-    // Auto-copy
     navigator.clipboard.writeText(code).then(function() {
-        status('Done! ' + code.split('\n').length + ' lines — injected & copied.');
+        status('\u2705 Done! ' + code.split('\n').length + ' lines \u2014 injected & copied.');
     });
 }
 
 function start(prompt) {
     running = true; continues = 0; accumulated = ''; lastRawTail = '';
     prevHadUnclosedBlock = false; lastTurns = getTurns();
-    updateBtn(); status('Submitting...');
+    incrementProcessing();
+    updateBtn(); status('\u23F3 Submitting...');
     submit(buildInitial(prompt));
     setTimeout(poll, 5000);
 }
 
-function stop() { running = false; clearWait(); updateBtn(); status('Stopped.'); }
+function stop() { running = false; clearWait(); updateBtn(); status('\u23F9 Stopped.'); }
 function status(msg) { var el = $('#acl-status'); if (el) el.textContent = msg; }
 function updateBtn() {
     var btn = $('#acl-btn');
@@ -366,28 +439,50 @@ function updateBtn() {
 function initUI() {
     var s = document.createElement('style');
     s.textContent = [
-        '#acl-bar{position:fixed;bottom:0;left:0;right:0;z-index:9999999;display:flex;align-items:center;background:#0a0814;border-top:1px solid rgba(139,92,246,.3);padding:6px 10px;gap:8px;font:13px "SF Mono",monospace;}',
-        '#acl-input{flex:1;background:#1a1528;color:#e2e8f0;border:1px solid #333;border-radius:6px;padding:10px 14px;font:inherit;resize:none;min-height:38px;max-height:150px;}',
-        '#acl-btn{width:44px;height:38px;border:none;border-radius:8px;cursor:pointer;background:#7c3aed;color:#fff;font-size:18px;}',
-        '#acl-btn.acl-on{background:#dc2626;animation:acl-p 1s infinite}',
-        '@keyframes acl-p{50%{opacity:.5}}',
-        '#acl-status{color:#a5b4fc;font-size:11px;min-width:200px;}',
-        '#acl-wait{display:none;position:fixed;bottom:70px;left:50%;transform:translateX(-50%);z-index:9999999;align-items:center;gap:14px;background:#0f0b1e;border:1px solid rgba(139,92,246,.4);border-radius:14px;padding:14px 24px;box-shadow:0 10px 40px rgba(0,0,0,.6);}',
-        '#acl-wait-time{font:700 32px "SF Mono",monospace;color:#c4b5fd;min-width:55px;text-align:center;}',
-        '#acl-wait-track{width:140px;height:6px;background:rgba(139,92,246,.15);border-radius:3px;overflow:hidden;}',
-        '#acl-wait-bar{height:100%;width:0%;background:linear-gradient(90deg,#7c3aed,#a855f7);border-radius:3px;transition:width 1s linear;}',
-        '#acl-skip{padding:12px 28px;border:none;border-radius:10px;cursor:pointer;background:#7c3aed;color:#fff;font:700 15px sans-serif;transition:all .15s;letter-spacing:.5px;}',
-        '#acl-skip:hover{background:#6d28d9;transform:scale(1.05);}',
+        '#acl-bar{position:fixed;bottom:0;left:0;right:0;z-index:9999999;display:flex;align-items:center;background:linear-gradient(180deg,#0d0820,#0a0814);border-top:1px solid rgba(139,92,246,.4);padding:8px 12px;gap:10px;font:13px "SF Mono",monospace;box-shadow:0 -4px 30px rgba(124,58,237,.15);}',
+        '#acl-input{flex:1;background:linear-gradient(135deg,#1a1528,#150f25);color:#e2e8f0;border:1px solid rgba(139,92,246,.3);border-radius:10px;padding:12px 16px;font:inherit;resize:none;min-height:38px;max-height:150px;transition:border-color .2s,box-shadow .2s;}',
+        '#acl-input:focus{outline:none;border-color:#7c3aed;box-shadow:0 0 0 3px rgba(124,58,237,.2);}',
+        '#acl-btn{width:44px;height:40px;border:none;border-radius:10px;cursor:pointer;background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;font-size:18px;transition:all .15s;box-shadow:0 4px 15px rgba(124,58,237,.4);}',
+        '#acl-btn:hover{transform:scale(1.05);box-shadow:0 6px 20px rgba(124,58,237,.5);}',
+        '#acl-btn.acl-on{background:linear-gradient(135deg,#dc2626,#b91c1c);box-shadow:0 4px 15px rgba(220,38,38,.4);animation:acl-p 1.5s infinite}',
+        '@keyframes acl-p{0%,100%{opacity:1}50%{opacity:.5}}',
+        '#acl-status{color:#a5b4fc;font-size:11px;min-width:200px;text-shadow:0 0 10px rgba(165,180,252,.3);}',
+        '#acl-counter{display:flex;align-items:center;gap:14px;padding:4px 14px;background:rgba(124,58,237,.08);border:1px solid rgba(139,92,246,.2);border-radius:10px;margin-left:auto;}',
+        '#acl-counter-title{font:600 11px sans-serif;color:#c4b5fd;white-space:nowrap;letter-spacing:.3px;}',
+        '.acl-counter-badge{display:flex;align-items:center;gap:4px;font:700 14px "SF Mono",monospace;}',
+        '.acl-counter-badge.processing{color:#fbbf24;text-shadow:0 0 8px rgba(251,191,36,.4);}',
+        '.acl-counter-badge.done{color:#34d399;text-shadow:0 0 8px rgba(52,211,153,.4);}',
+        '.acl-counter-badge.total{color:#a5b4fc;text-shadow:0 0 8px rgba(165,180,252,.4);}',
+        '.acl-counter-sep{width:1px;height:18px;background:rgba(139,92,246,.3);}',
+        '#acl-wait{display:none;position:fixed;bottom:75px;left:50%;transform:translateX(-50%);z-index:9999999;align-items:center;gap:14px;background:linear-gradient(135deg,#0f0b1e,#1a1035);border:1px solid rgba(139,92,246,.4);border-radius:16px;padding:16px 28px;box-shadow:0 15px 50px rgba(0,0,0,.7),0 0 30px rgba(124,58,237,.15);}',
+        '#acl-wait-time{font:700 34px "SF Mono",monospace;color:#c4b5fd;min-width:55px;text-align:center;text-shadow:0 0 15px rgba(196,181,253,.3);}',
+        '#acl-wait-track{width:150px;height:7px;background:rgba(139,92,246,.12);border-radius:4px;overflow:hidden;}',
+        '#acl-wait-bar{height:100%;width:0%;background:linear-gradient(90deg,#7c3aed,#a855f7,#c084fc);border-radius:4px;transition:width 1s linear;box-shadow:0 0 8px rgba(168,85,247,.5);}',
+        '#acl-skip{padding:13px 30px;border:none;border-radius:12px;cursor:pointer;background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;font:700 15px sans-serif;transition:all .15s;letter-spacing:.5px;box-shadow:0 4px 20px rgba(124,58,237,.4);}',
+        '#acl-skip:hover{background:linear-gradient(135deg,#6d28d9,#5b21b6);transform:scale(1.05);box-shadow:0 6px 25px rgba(124,58,237,.5);}',
         '#acl-skip:active{transform:scale(.97);}',
-        '#acl-panel{display:none;flex-direction:column;position:fixed;inset:5%;z-index:99999999;background:#0a0a0f;border:1px solid #7c3aed;border-radius:12px;overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.7);}',
-        '#acl-panel pre{flex:1;overflow:auto;padding:16px;margin:0;color:#e2e8f0;font:12px/1.6 "SF Mono",monospace;white-space:pre-wrap;}',
-        '#acl-panel-bar{display:flex;gap:8px;padding:12px;border-top:1px solid #333;}',
-        '#acl-panel-bar button{padding:8px 16px;border:none;border-radius:8px;cursor:pointer;font:600 12px sans-serif;}'
+        '#acl-panel{display:none;flex-direction:column;position:fixed;inset:5%;z-index:99999999;background:linear-gradient(180deg,#0a0a0f,#0d0820);border:1px solid rgba(124,58,237,.5);border-radius:16px;overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.8),0 0 40px rgba(124,58,237,.1);}',
+        '#acl-panel pre{flex:1;overflow:auto;padding:20px;margin:0;color:#e2e8f0;font:12px/1.6 "SF Mono",monospace;white-space:pre-wrap;}',
+        '#acl-panel-bar{display:flex;gap:10px;padding:14px;border-top:1px solid rgba(139,92,246,.2);background:rgba(0,0,0,.3);}',
+        '#acl-panel-bar button{padding:10px 20px;border:none;border-radius:10px;cursor:pointer;font:600 12px sans-serif;transition:all .15s;}',
+        '#acl-panel-bar button:hover{transform:scale(1.03);}'
     ].join('\n');
     document.head.appendChild(s);
 
     var bar = document.createElement('div'); bar.id = 'acl-bar';
-    bar.innerHTML = '<textarea id="acl-input" placeholder="Prompt... (Enter to go)" rows="1"></textarea><button id="acl-btn">\u25B6</button><span id="acl-status">Ready</span>';
+    bar.innerHTML = [
+        '<textarea id="acl-input" placeholder="\u2728 Prompt eingeben... (Enter zum Starten)" rows="1"></textarea>',
+        '<button id="acl-btn">\u25B6</button>',
+        '<span id="acl-status">\u2728 Ready</span>',
+        '<div id="acl-counter">',
+        '  <span id="acl-counter-title">\u2728 KI Auto-Coder \u2014 Bereit</span>',
+        '  <div class="acl-counter-sep"></div>',
+        '  <span class="acl-counter-badge processing">\u23F3 <span id="acl-count-processing">0</span></span>',
+        '  <span class="acl-counter-badge done">\u2705 <span id="acl-count-done">0</span></span>',
+        '  <div class="acl-counter-sep"></div>',
+        '  <span class="acl-counter-badge total">\u03A3 <span id="acl-count-total">0</span></span>',
+        '</div>'
+    ].join('');
     document.body.appendChild(bar);
 
     var wait = document.createElement('div'); wait.id = 'acl-wait';
@@ -395,7 +490,7 @@ function initUI() {
     document.body.appendChild(wait);
 
     var panel = document.createElement('div'); panel.id = 'acl-panel';
-    panel.innerHTML = '<pre></pre><div id="acl-panel-bar"><button id="acl-copy" style="background:#2563eb;color:#fff">Copy</button><button id="acl-dl" style="background:#d97706;color:#fff">Download</button><button id="acl-close" style="background:#333;color:#fff">Close</button></div>';
+    panel.innerHTML = '<pre></pre><div id="acl-panel-bar"><button id="acl-copy" style="background:linear-gradient(135deg,#2563eb,#1d4ed8);color:#fff">Copy</button><button id="acl-dl" style="background:linear-gradient(135deg,#d97706,#b45309);color:#fff">Download</button><button id="acl-close" style="background:linear-gradient(135deg,#374151,#1f2937);color:#fff">Close</button></div>';
     document.body.appendChild(panel);
 
     $('#acl-input').addEventListener('keydown', function(e) {
@@ -405,13 +500,15 @@ function initUI() {
     $('#acl-skip').addEventListener('click', doSkip);
     $('#acl-close').addEventListener('click', function() { panel.style.display = 'none'; });
     $('#acl-copy').addEventListener('click', function() {
-        navigator.clipboard.writeText(accumulated.trim()).then(function() { status('Copied!'); });
+        navigator.clipboard.writeText(accumulated.trim()).then(function() { status('\u2705 Copied!'); });
     });
     $('#acl-dl').addEventListener('click', function() {
         var a = document.createElement('a');
         a.href = URL.createObjectURL(new Blob([accumulated.trim()]));
         a.download = 'output.html'; a.click();
     });
+
+    updateCounter();
 }
 
 function toggle() {
