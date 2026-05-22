@@ -2,7 +2,7 @@
 // @name         Auto-Coder v7
 // @namespace    http://tampermonkey.net/
 // @version      7.0
-// @description  Auto-continue with overlap, timer + skip button, >>>CODE STARTS<<< markers.
+// @description  Auto-continue with overlap, timer + skip, >>>CODE STARTS<<< markers.
 // @match        https://you.com/*
 // @grant        none
 // ==/UserScript==
@@ -21,7 +21,7 @@ var MAX = 15;
 var POLL_MS = 2500;
 
 var running = false, continues = 0, lastTurns = 0;
-var codeParts = [], lastTail = '', waitTimer = null, waitRemaining = 0;
+var codeParts = [], lastTail = '', lastRawTail = '', waitTimer = null, waitRemaining = 0;
 
 var $ = function(s) { return document.querySelector(s); };
 var getTurns = function() { return document.querySelectorAll('[data-testid^="youchat-answer-turn-"]').length; };
@@ -97,6 +97,22 @@ function isDone(text) { return text.indexOf(FINISH) !== -1; }
 
 function getAccumulated() { return codeParts.join('\n'); }
 
+function getRawTail(text) {
+    // Get the last meaningful lines from the raw response, regardless of markers.
+    // We want: 2 fully complete lines + the (possibly incomplete) last line.
+    var lines = text.split('\n');
+    // Walk backwards to find last non-empty, non-marker lines
+    var meaningful = [];
+    for (var i = lines.length - 1; i >= 0; i--) {
+        var l = lines[i].trim();
+        if (l === '' || l === FENCE || l === CODE_END || l === CODE_START || l === FINISH) continue;
+        if (l.indexOf('>>>') === 0) continue;
+        meaningful.unshift(lines[i]);
+        if (meaningful.length >= 3) break;
+    }
+    return meaningful.join('\n');
+}
+
 function poll() {
     if (!running) return;
     if (isGen()) { setTimeout(poll, POLL_MS); return; }
@@ -116,9 +132,15 @@ function handleResponse() {
         else codeParts[codeParts.length - 1] = mergeOverlap(codeParts[codeParts.length - 1], blocks[i]);
     }
 
+    // Always grab the raw tail from the response for the continue prompt
+    lastRawTail = getRawTail(text);
+
+    // Also get tail from accumulated code as fallback
     var accumulated = getAccumulated();
-    var accLines = accumulated.split('\n');
-    lastTail = accLines.slice(-10).join('\n');
+    if (accumulated) {
+        var accLines = accumulated.split('\n');
+        lastTail = accLines.slice(-10).join('\n');
+    }
 
     if (isDone(text) || continues >= MAX) { finish(); }
     else { scheduleNext(); }
@@ -174,14 +196,17 @@ function updateWaitUI() {
 }
 
 function buildContinue() {
+    // Use raw tail (last 2 complete lines + incomplete last line from the actual response)
+    // This ensures the AI sees exactly what it last wrote, even if extraction failed
+    var tail = lastRawTail || lastTail;
     var lines = [];
     lines.push('Continue EXACTLY where you left off. Here are the last lines you wrote:');
     lines.push('');
     lines.push(FENCE);
-    lines.push(lastTail);
+    lines.push(tail);
     lines.push(FENCE);
     lines.push('');
-    lines.push('Resume from the VERY NEXT LINE. Do NOT repeat those lines.');
+    lines.push('Repeat those last 2 complete lines for overlap, then continue from there.');
     lines.push('');
     lines.push('RULES:');
     lines.push('- Wrap code in ' + CODE_START + ' and ' + CODE_END);
@@ -204,6 +229,7 @@ function buildInitial(userText) {
     lines.push('2. Replace EVERY backtick inside your code with: ' + BACKTICK_ESC);
     lines.push('3. When completely finished, write on its own line: ' + FINISH);
     lines.push('4. If response gets long, just stop mid-code. I will say continue.');
+    lines.push('5. Keep functions short (~10 lines max).');
     lines.push('==================');
     return lines.join('\n');
 }
@@ -222,7 +248,7 @@ function finish() {
 }
 
 function start(prompt) {
-    running = true; continues = 0; codeParts = []; lastTail = ''; lastTurns = getTurns();
+    running = true; continues = 0; codeParts = []; lastTail = ''; lastRawTail = ''; lastTurns = getTurns();
     updateBtn(); status('Submitting...');
     submit(buildInitial(prompt));
     setTimeout(poll, 5000);
@@ -245,12 +271,13 @@ function initUI() {
         '#acl-btn.acl-on{background:#dc2626;animation:acl-p 1s infinite}' +
         '@keyframes acl-p{50%{opacity:.5}}' +
         '#acl-status{color:#a5b4fc;font-size:11px;min-width:200px;}' +
-        '#acl-wait{display:none;position:fixed;bottom:60px;left:50%;transform:translateX(-50%);z-index:9999999;align-items:center;gap:12px;background:#0f0b1e;border:1px solid rgba(139,92,246,.4);border-radius:12px;padding:12px 20px;box-shadow:0 10px 40px rgba(0,0,0,.6);}' +
-        '#acl-wait-time{font:700 28px "SF Mono",monospace;color:#c4b5fd;min-width:50px;text-align:center;}' +
-        '#acl-wait-track{width:120px;height:6px;background:rgba(139,92,246,.15);border-radius:3px;overflow:hidden;}' +
+        '#acl-wait{display:none;position:fixed;bottom:70px;left:50%;transform:translateX(-50%);z-index:9999999;align-items:center;gap:14px;background:#0f0b1e;border:1px solid rgba(139,92,246,.4);border-radius:14px;padding:14px 24px;box-shadow:0 10px 40px rgba(0,0,0,.6);}' +
+        '#acl-wait-time{font:700 32px "SF Mono",monospace;color:#c4b5fd;min-width:55px;text-align:center;}' +
+        '#acl-wait-track{width:140px;height:6px;background:rgba(139,92,246,.15);border-radius:3px;overflow:hidden;}' +
         '#acl-wait-bar{height:100%;width:0%;background:linear-gradient(90deg,#7c3aed,#a855f7);border-radius:3px;transition:width 1s linear;}' +
-        '#acl-skip{padding:10px 24px;border:none;border-radius:8px;cursor:pointer;background:#7c3aed;color:#fff;font:700 14px sans-serif;transition:all .15s;}' +
+        '#acl-skip{padding:12px 28px;border:none;border-radius:10px;cursor:pointer;background:#7c3aed;color:#fff;font:700 15px sans-serif;transition:all .15s;letter-spacing:.5px;}' +
         '#acl-skip:hover{background:#6d28d9;transform:scale(1.05);}' +
+        '#acl-skip:active{transform:scale(.97);}' +
         '#acl-panel{display:none;flex-direction:column;position:fixed;inset:5%;z-index:99999999;background:#0a0a0f;border:1px solid #7c3aed;border-radius:12px;overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.7);}' +
         '#acl-panel pre{flex:1;overflow:auto;padding:16px;margin:0;color:#e2e8f0;font:12px/1.6 "SF Mono",monospace;white-space:pre-wrap;}' +
         '#acl-panel-bar{display:flex;gap:8px;padding:12px;border-top:1px solid #333;}' +
@@ -262,7 +289,7 @@ function initUI() {
     document.body.appendChild(bar);
 
     var wait = document.createElement('div'); wait.id = 'acl-wait';
-    wait.innerHTML = '<span id="acl-wait-time">25s</span><div id="acl-wait-track"><div id="acl-wait-bar"></div></div><button id="acl-skip">SKIP \u25B6</button>';
+    wait.innerHTML = '<span id="acl-wait-time">25s</span><div id="acl-wait-track"><div id="acl-wait-bar"></div></div><button id="acl-skip">SKIP \u25B6\u25B6</button>';
     document.body.appendChild(wait);
 
     var panel = document.createElement('div'); panel.id = 'acl-panel';
