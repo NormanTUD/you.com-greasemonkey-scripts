@@ -624,7 +624,7 @@ function mergeOverlap(existing, fragment) {
     }
 
     log('Merge: no overlap found, concatenating');
-    return existing + '\n' + fragment;
+    return aLines.join('\n') + '\n' + bLines.join('\n');
 }
 
 // ============================================================
