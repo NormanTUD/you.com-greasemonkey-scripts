@@ -13,7 +13,6 @@
 var BT = String.fromCharCode(96);
 var FENCE = BT + BT + BT;
 var FINISH_MARKER = 'AUTOCODER_FINISHED';
-var OVERLAP_LINES = 5;
 var DELAY_MS = 25000;
 var MAX = 25;
 var POLL_MS = 1500;
@@ -50,6 +49,7 @@ var responseHandleTimeout = null;
 var isProcessingResponse = false;
 var debugLog = [];
 var showMergedOutput = false;
+var OVERLAP_LINES = 8;
 
 function log(msg) {
     var entry = '[AutoCoder ' + new Date().toISOString().slice(11,19) + '] ' + msg;
@@ -480,31 +480,7 @@ function fixTruncatedTail(aLines, bLines) {
     return false;
 }
 
-function mergeOverlap(existing, fragment) {
-    if (!existing) return fragment;
-    if (!fragment) return existing;
-    if (fragment.trim().length < 30 && existing.trim().length > 100) return existing;
-    var aLines = existing.split('\n');
-    var bLines = fragment.split('\n');
-    fixTruncatedTail(aLines, bLines);
-    var exact = findExactOverlap(aLines, bLines);
-    if (exact > 0) {
-        log('Merge: exact overlap of ' + exact + ' lines');
-        var remainder = bLines.slice(exact);
-        if (remainder.length === 0) return aLines.join('\n');
-        return aLines.join('\n') + '\n' + remainder.join('\n');
-    }
-    var partial = findPartialOverlap(aLines, bLines);
-    if (partial) {
-        log('Merge: partial overlap at posA=' + partial.posA + ' startB=' + partial.startB);
-        var head = aLines.slice(0, partial.posA);
-        var tail = bLines.slice(partial.startB);
-        if (head.length === 0) return tail.join('\n');
-        return head.join('\n') + '\n' + tail.join('\n');
-    }
-    log('Merge: no overlap found, concatenating');
-    return aLines.join('\n') + '\n' + bLines.join('\n');
-}
+
 
 function getRawTail() {
     var code = getLastCodeFromDOM();
@@ -941,15 +917,76 @@ function updateWaitUI() {
 // FIX: Continue prompt warns AI not to start with triple backticks
 // ============================================================
 
+function detectMidLineSplit(aLines, bLines) {
+    if (aLines.length === 0 || bLines.length === 0) return false;
+    var lastA = aLines[aLines.length - 1];
+    var firstBIdx = 0;
+    while (firstBIdx < bLines.length && bLines[firstBIdx].trim() === '') firstBIdx++;
+    if (firstBIdx >= bLines.length) return false;
+    var firstB = bLines[firstBIdx].trim();
+    var lastATrimmed = lastA.trimEnd();
+    if (lastATrimmed.length === 0) return false;
+    var lastAEndsClean = /[;{})\]>\/\*]$/.test(lastATrimmed) || 
+                         /^\s*\/\//.test(lastATrimmed) ||
+                         /^\s*\*/.test(lastATrimmed) ||
+                         /^\s*$/.test(lastATrimmed);
+    if (lastAEndsClean) return false;
+    var firstBStartsClean = /^\s*[{}()\[\]<\/]/.test(firstB) ||
+                            /^\s*(var|let|const|function|if|else|for|while|return|case|break|default|switch|class|import|export)\b/.test(firstB) ||
+                            /^\s*\/[\/\*]/.test(firstB) ||
+                            /^\s*[.]\w/.test(firstB);
+    if (firstBStartsClean) return false;
+    return true;
+}
+
+function mergeOverlap(existing, fragment) {
+    if (!existing) return fragment;
+    if (!fragment) return existing;
+    if (fragment.trim().length < 30 && existing.trim().length > 100) return existing;
+    var aLines = existing.split('\n');
+    var bLines = fragment.split('\n');
+    fixTruncatedTail(aLines, bLines);
+    var exact = findExactOverlap(aLines, bLines);
+    if (exact > 0) {
+        log('Merge: exact overlap of ' + exact + ' lines');
+        var remainder = bLines.slice(exact);
+        if (remainder.length === 0) return aLines.join('\n');
+        return aLines.join('\n') + '\n' + remainder.join('\n');
+    }
+    var partial = findPartialOverlap(aLines, bLines);
+    if (partial) {
+        log('Merge: partial overlap at posA=' + partial.posA + ' startB=' + partial.startB);
+        var head = aLines.slice(0, partial.posA);
+        var tail = bLines.slice(partial.startB);
+        if (head.length === 0) return tail.join('\n');
+        return head.join('\n') + '\n' + tail.join('\n');
+    }
+    if (detectMidLineSplit(aLines, bLines)) {
+        var firstBIdx = 0;
+        while (firstBIdx < bLines.length && bLines[firstBIdx].trim() === '') firstBIdx++;
+        var joinedLine = aLines[aLines.length - 1] + bLines[firstBIdx];
+        var headLines = aLines.slice(0, aLines.length - 1);
+        var tailLines = bLines.slice(firstBIdx + 1);
+        log('Merge: mid-line split detected, joining last line of A with first line of B');
+        var result = headLines.join('\n');
+        if (result.length > 0) result += '\n';
+        result += joinedLine;
+        if (tailLines.length > 0) result += '\n' + tailLines.join('\n');
+        return result;
+    }
+    log('Merge: no overlap found, concatenating');
+    return aLines.join('\n') + '\n' + bLines.join('\n');
+}
+
 function buildContinuePrompt() {
     var tail = lastRawTail || getLastNLines(accumulated, OVERLAP_LINES);
     var noFenceWarning = 'IMPORTANT: Do NOT start your response with ' + FENCE + ' or any code fence. You are continuing MID-CODE inside an already-open code block. Just write the next lines of code directly.';
     return [
-        'Continue EXACTLY where you left off. Your last lines were:',
+        'Continue EXACTLY where you left off. You MUST repeat the last 3-4 lines from below so I can merge properly:',
         '', FENCE, tail, FENCE, '',
         noFenceWarning,
         '',
-        'Continue from there. Do NOT repeat those lines. Just write the next code.',
+        'CRITICAL: Start by repeating at least the last 3 lines shown above, then continue with new code after them. This overlap is required for proper merging.',
         'When you are 100% completely done with the ENTIRE file, write AUTOCODER_FINISHED after your code block on its own line.',
         '',
         'If you are NOT done yet, just stop mid-code. I will ask you to continue.',
