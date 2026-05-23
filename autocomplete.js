@@ -954,7 +954,7 @@ function buildContinuePrompt() {
         '',
         'If you are NOT done yet, just stop mid-code. I will ask you to continue.',
         'Do NOT write AUTOCODER_FINISHED unless the code is truly 100% complete.',
-        'Make sure you start code blocks with 3 backticks again, so it works. And make also sure you don\'t write backticks inside of them to not leave the code."
+        'Make sure you start code blocks with 3 backticks again, so it works. And make also sure you do not write backticks inside of them to not leave the code."
     ].join('\n');
 }
 
@@ -967,7 +967,7 @@ function buildInitialPrompt(userText) {
         'When you are 100% completely finished with the ENTIRE file, write AUTOCODER_FINISHED after your code block on its own line.',
         '',
         'Do NOT write AUTOCODER_FINISHED unless the code is truly 100% complete.',
-        'Make sure you start code blocks with 3 backticks again, so it works. And make also sure you don\'t write backticks inside of them to not leave the code.",
+        'Make sure you start code blocks with 3 backticks again, so it works. And make also sure you do not write backticks inside of them to not leave the code.",
         '============='
     ].join('\n');
 }
