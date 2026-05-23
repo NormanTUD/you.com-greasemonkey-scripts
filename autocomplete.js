@@ -426,59 +426,11 @@ function isResponseFullySettled() {
     return true;
 }
 
-function findExactOverlap(aLines, bLines) {
-    var maxCheck = Math.min(aLines.length, bLines.length, 30);
-    var best = 0;
-    for (var n = 1; n <= maxCheck; n++) {
-        var match = true;
-        for (var k = 0; k < n; k++) {
-            if (aLines[aLines.length - n + k].trim() !== bLines[k].trim()) { match = false; break; }
-        }
-        if (match) best = n;
-    }
-    return best;
-}
 
-function findPartialOverlap(aLines, bLines) {
-    for (var startB = 0; startB < Math.min(8, bLines.length); startB++) {
-        if (bLines[startB].trim() === '') continue;
-        for (var posA = Math.max(0, aLines.length - 40); posA < aLines.length; posA++) {
-            if (aLines[posA].trim() !== bLines[startB].trim()) continue;
-            var matchLen = 1;
-            while (posA + matchLen < aLines.length && startB + matchLen < bLines.length &&
-                   aLines[posA + matchLen].trim() === bLines[startB + matchLen].trim()) {
-                matchLen++;
-            }
-            if (posA + matchLen >= aLines.length && matchLen >= 2) {
-                return { posA: posA, startB: startB };
-            }
-        }
-    }
-    return null;
-}
 
-function fixTruncatedTail(aLines, bLines) {
-    if (aLines.length === 0 || bLines.length === 0) return false;
-    var lastA = aLines[aLines.length - 1].trim();
-    if (lastA.length === 0) return false;
-    var firstBIdx = 0;
-    while (firstBIdx < bLines.length && bLines[firstBIdx].trim() === '') firstBIdx++;
-    if (firstBIdx >= bLines.length) return false;
-    var firstB = bLines[firstBIdx].trim();
-    if (firstB.length > lastA.length && firstB.indexOf(lastA) === 0) {
-        aLines.pop();
-        return true;
-    }
-    if (lastA.length >= 3 && firstB.length > lastA.length) {
-        var lastANoTrail = lastA.replace(/\s+$/, '');
-        var firstBStart = firstB.substring(0, lastANoTrail.length);
-        if (firstBStart === lastANoTrail) {
-            aLines.pop();
-            return true;
-        }
-    }
-    return false;
-}
+
+
+
 
 
 
@@ -917,6 +869,169 @@ function updateWaitUI() {
 // FIX: Continue prompt warns AI not to start with triple backticks
 // ============================================================
 
+
+
+function findExactOverlap(aLines, bLines) {
+    var maxCheck = Math.min(aLines.length, bLines.length, 30);
+    var best = 0;
+    for (var n = 1; n <= maxCheck; n++) {
+        var match = true;
+        for (var k = 0; k < n; k++) {
+            if (aLines[aLines.length - n + k].trim() !== bLines[k].trim()) { match = false; break; }
+        }
+        if (match) best = n;
+    }
+    return best;
+}
+
+function findPartialOverlap(aLines, bLines) {
+    // Look for a sequence of lines in B that matches a sequence at the END of A
+    // Key insight: the overlap might start BEFORE a truncated last line in A
+    for (var startB = 0; startB < Math.min(10, bLines.length); startB++) {
+        if (bLines[startB].trim() === '') continue;
+        for (var posA = Math.max(0, aLines.length - 50); posA < aLines.length; posA++) {
+            if (aLines[posA].trim() !== bLines[startB].trim()) continue;
+            var matchLen = 1;
+            while (posA + matchLen < aLines.length && startB + matchLen < bLines.length &&
+                   aLines[posA + matchLen].trim() === bLines[startB + matchLen].trim()) {
+                matchLen++;
+            }
+            // Case 1: match reaches the end of A exactly
+            if (posA + matchLen >= aLines.length && matchLen >= 2) {
+                return { posA: posA, startB: startB, matchLen: matchLen, truncatedTail: false };
+            }
+            // Case 2: match reaches aLines.length - 1 (all but last line matched)
+            // AND the last line of A looks truncated (it's a partial line that doesn't match)
+            // This handles the case where the last line of A is a cut-off version of a line in B
+            if (posA + matchLen === aLines.length - 1 && matchLen >= 2) {
+                var lastA = aLines[aLines.length - 1].trim();
+                var correspondingB = (startB + matchLen < bLines.length) ? bLines[startB + matchLen].trim() : '';
+                // Check if lastA is a prefix/truncation of the corresponding B line
+                if (lastA.length > 0 && correspondingB.length > lastA.length && correspondingB.indexOf(lastA) === 0) {
+                    return { posA: posA, startB: startB, matchLen: matchLen + 1, truncatedTail: true };
+                }
+                // Also check if lastA is just a truncated line (unmatched quotes, unclosed parens, etc.)
+                if (lastA.length > 0 && isLineTruncated(lastA)) {
+                    return { posA: posA, startB: startB, matchLen: matchLen + 1, truncatedTail: true };
+                }
+            }
+        }
+    }
+    return null;
+}
+
+function isLineTruncated(line) {
+    // Check if a line appears to be cut off mid-way
+    var trimmed = line.trim();
+    if (trimmed.length === 0) return false;
+    // Unbalanced quotes
+    var singleQuotes = countChar(trimmed, "'");
+    var doubleQuotes = countChar(trimmed, '"');
+    if (singleQuotes % 2 !== 0) return true;
+    if (doubleQuotes % 2 !== 0) return true;
+    // Unbalanced parentheses
+    var openParens = countChar(trimmed, '(');
+    var closeParens = countChar(trimmed, ')');
+    if (openParens > closeParens) return true;
+    // Unbalanced brackets
+    var openBrackets = countChar(trimmed, '[');
+    var closeBrackets = countChar(trimmed, ']');
+    if (openBrackets > closeBrackets) return true;
+    // Ends with operators or incomplete tokens
+    if (/[+\-*\/=,({|&:\\]$/.test(trimmed)) return true;
+    // Ends mid-word (no terminator)
+    if (/[a-zA-Z]$/.test(trimmed) && !/;$/.test(trimmed) && !/\*\/$/.test(trimmed)) {
+        // Could be truncated mid-word, but this is less certain
+        // Only flag if it also has unbalanced quotes or parens above
+        return false;
+    }
+    return false;
+}
+
+function fixTruncatedTail(aLines, bLines) {
+    if (aLines.length === 0 || bLines.length === 0) return false;
+    var lastA = aLines[aLines.length - 1].trim();
+    if (lastA.length === 0) return false;
+    var firstBIdx = 0;
+    while (firstBIdx < bLines.length && bLines[firstBIdx].trim() === '') firstBIdx++;
+    if (firstBIdx >= bLines.length) return false;
+    var firstB = bLines[firstBIdx].trim();
+    // Case: first line of B is the complete version of the truncated last line of A
+    if (firstB.length > lastA.length && firstB.indexOf(lastA) === 0) {
+        aLines.pop();
+        return true;
+    }
+    if (lastA.length >= 3 && firstB.length > lastA.length) {
+        var lastANoTrail = lastA.replace(/\s+$/, '');
+        var firstBStart = firstB.substring(0, lastANoTrail.length);
+        if (firstBStart === lastANoTrail) {
+            aLines.pop();
+            return true;
+        }
+    }
+    return false;
+}
+
+function findOverlapWithTruncation(aLines, bLines) {
+    // This is the KEY new function that handles the specific failure case:
+    // A ends with a truncated line, and B starts with context that overlaps
+    // lines BEFORE the truncated line in A.
+    //
+    // Example:
+    // A: [..., "ctx.fillStyle = '#ce93d8';", "ctx.font = '14px Segoe UI';", ... , "ctx.fillText('In set theory, {true, false} != {0, 1} even though they are"]
+    // B: ["ctx.fillStyle = '#ce93d8';", "ctx.font = '14px Segoe UI';", ..., "ctx.fillText('In set theory, {true, false} != {0, 1} even though they are isomorphic', width / 2, height - 35);", ...]
+    //
+    // We need to find where B's lines match a sequence in A (possibly ending before A's last line),
+    // and if A's last line is a truncated prefix of the next line in B after the matched region.
+
+    var lastA = aLines[aLines.length - 1].trim();
+    var lastAIsTruncated = isLineTruncated(lastA);
+
+    if (!lastAIsTruncated) return null;
+
+    // Try to find where B's opening lines match a sequence in A that ends just before the truncated last line
+    for (var startB = 0; startB < Math.min(10, bLines.length); startB++) {
+        if (bLines[startB].trim() === '') continue;
+        // Search backwards from the second-to-last line of A
+        for (var posA = Math.max(0, aLines.length - 50); posA < aLines.length - 1; posA++) {
+            if (aLines[posA].trim() !== bLines[startB].trim()) continue;
+            // Count how many consecutive lines match
+            var matchLen = 1;
+            var bIdx = startB + 1;
+            var aIdx = posA + 1;
+            while (aIdx < aLines.length - 1 && bIdx < bLines.length &&
+                   aLines[aIdx].trim() === bLines[bIdx].trim()) {
+                matchLen++;
+                aIdx++;
+                bIdx++;
+            }
+            // Now aIdx should be at aLines.length - 1 (the truncated line)
+            // Check if the truncated last line of A is a prefix of bLines[bIdx]
+            if (aIdx === aLines.length - 1 && matchLen >= 2) {
+                if (bIdx < bLines.length) {
+                    var bLineAtTrunc = bLines[bIdx].trim();
+                    if (bLineAtTrunc.indexOf(lastA) === 0 || lastA.length === 0) {
+                        // Perfect: the truncated line is a prefix of the B line
+                        // Return: keep A up to posA (exclusive), take B from startB onward
+                        return { posA: posA, startB: startB };
+                    }
+                    // Even if it's not a perfect prefix match, if the last line is clearly truncated
+                    // and we have a good match sequence, trust the overlap
+                    if (matchLen >= 3) {
+                        return { posA: posA, startB: startB };
+                    }
+                }
+                // If bIdx >= bLines.length, the entire B is within A (minus truncated tail)
+                // This shouldn't normally happen but handle it
+                if (bIdx >= bLines.length && matchLen >= 2) {
+                    return { posA: posA, startB: startB };
+                }
+            }
+        }
+    }
+    return null;
+}
+
 function detectMidLineSplit(aLines, bLines) {
     if (aLines.length === 0 || bLines.length === 0) return false;
     var lastA = aLines[aLines.length - 1];
@@ -926,7 +1041,7 @@ function detectMidLineSplit(aLines, bLines) {
     var firstB = bLines[firstBIdx].trim();
     var lastATrimmed = lastA.trimEnd();
     if (lastATrimmed.length === 0) return false;
-    var lastAEndsClean = /[;{})\]>\/\*]$/.test(lastATrimmed) || 
+    var lastAEndsClean = /[;{})\]>\/\*]$/.test(lastATrimmed) ||
                          /^\s*\/\//.test(lastATrimmed) ||
                          /^\s*\*/.test(lastATrimmed) ||
                          /^\s*$/.test(lastATrimmed);
@@ -943,9 +1058,25 @@ function mergeOverlap(existing, fragment) {
     if (!existing) return fragment;
     if (!fragment) return existing;
     if (fragment.trim().length < 30 && existing.trim().length > 100) return existing;
+
     var aLines = existing.split('\n');
     var bLines = fragment.split('\n');
+
+    // Step 0: Try the truncation-aware overlap detection FIRST
+    // This handles the critical case where A ends mid-line and B repeats context before continuing
+    var truncOverlap = findOverlapWithTruncation(aLines, bLines);
+    if (truncOverlap) {
+        log('Merge: truncation-aware overlap at posA=' + truncOverlap.posA + ' startB=' + truncOverlap.startB);
+        var head = aLines.slice(0, truncOverlap.posA);
+        var tail = bLines.slice(truncOverlap.startB);
+        if (head.length === 0) return tail.join('\n');
+        return head.join('\n') + '\n' + tail.join('\n');
+    }
+
+    // Step 1: Try fixTruncatedTail (simple case: first line of B completes last line of A)
     fixTruncatedTail(aLines, bLines);
+
+    // Step 2: Try exact overlap (last N lines of A match first N lines of B)
     var exact = findExactOverlap(aLines, bLines);
     if (exact > 0) {
         log('Merge: exact overlap of ' + exact + ' lines');
@@ -953,14 +1084,18 @@ function mergeOverlap(existing, fragment) {
         if (remainder.length === 0) return aLines.join('\n');
         return aLines.join('\n') + '\n' + remainder.join('\n');
     }
+
+    // Step 3: Try partial overlap (a sequence in B matches a sequence at end of A)
     var partial = findPartialOverlap(aLines, bLines);
     if (partial) {
-        log('Merge: partial overlap at posA=' + partial.posA + ' startB=' + partial.startB);
-        var head = aLines.slice(0, partial.posA);
-        var tail = bLines.slice(partial.startB);
-        if (head.length === 0) return tail.join('\n');
-        return head.join('\n') + '\n' + tail.join('\n');
+        log('Merge: partial overlap at posA=' + partial.posA + ' startB=' + partial.startB + ' truncated=' + partial.truncatedTail);
+        var headP = aLines.slice(0, partial.posA);
+        var tailP = bLines.slice(partial.startB);
+        if (headP.length === 0) return tailP.join('\n');
+        return headP.join('\n') + '\n' + tailP.join('\n');
     }
+
+    // Step 4: Mid-line split (last line of A + first line of B form one complete line)
     if (detectMidLineSplit(aLines, bLines)) {
         var firstBIdx = 0;
         while (firstBIdx < bLines.length && bLines[firstBIdx].trim() === '') firstBIdx++;
@@ -974,6 +1109,8 @@ function mergeOverlap(existing, fragment) {
         if (tailLines.length > 0) result += '\n' + tailLines.join('\n');
         return result;
     }
+
+    // Step 5: No overlap found, just concatenate
     log('Merge: no overlap found, concatenating');
     return aLines.join('\n') + '\n' + bLines.join('\n');
 }
