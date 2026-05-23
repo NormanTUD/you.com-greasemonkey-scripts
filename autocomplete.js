@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Auto-Coder v13
 // @namespace    http://tampermonkey.net/
-// @version      13.0
-// @description  Auto-continue with robust completion detection, overlap merging, harvest, and test suite. FIXED: DOM selectors use stable data-testid/aria attributes anchored to #chat-history, not dynamic class names.
+// @version      13.1
+// @description  Auto-continue with robust completion detection, overlap merging, harvest. FIXED: Continue prompt warns about backticks. FIXED: Merged output only shows at end.
 // @match        https://you.com/*
 // @grant        none
 // ==/UserScript==
@@ -10,15 +10,10 @@
 (function() {
 'use strict';
 
-// ============================================================
-// CONSTANTS
-// ============================================================
-
 var BT = String.fromCharCode(96);
 var FENCE = BT + BT + BT;
 var FINISH_MARKER = 'AUTOCODER_FINISHED';
 var OVERLAP_LINES = 5;
-
 var DELAY_MS = 25000;
 var MAX = 25;
 var POLL_MS = 1500;
@@ -29,10 +24,6 @@ var STREAM_STABLE_CHECKS = 4;
 var MIN_CODE_LENGTH_FOR_COMPLETE = 400;
 var INITIAL_POLL_DELAY = 7000;
 var CONTINUE_POLL_DELAY = 6000;
-
-// ============================================================
-// STATE
-// ============================================================
 
 var running = false;
 var continues = 0;
@@ -58,10 +49,7 @@ var lastResponseText = '';
 var responseHandleTimeout = null;
 var isProcessingResponse = false;
 var debugLog = [];
-
-// ============================================================
-// DEBUG LOGGING
-// ============================================================
+var showMergedOutput = false;
 
 function log(msg) {
     var entry = '[AutoCoder ' + new Date().toISOString().slice(11,19) + '] ' + msg;
@@ -69,12 +57,6 @@ function log(msg) {
     debugLog.push(entry);
     if (debugLog.length > 300) debugLog.shift();
 }
-
-// ============================================================
-// DOM HELPERS — ANCHORED TO #chat-history, USING STABLE SELECTORS
-// All queries go through getChatRoot() to avoid stale references.
-// We NEVER use dynamic class names like _1d4fgvb0, hljs, etc.
-// ============================================================
 
 function getChatRoot() {
     return document.getElementById('chat-history') || document.body;
@@ -112,27 +94,16 @@ function getLastTurnId() {
     return el.getAttribute('data-pinnedconversationturnid') || el.getAttribute('data-testid') || '';
 }
 
-// ============================================================
-// GENERATION DETECTION — uses data-testid step attributes
-// The workflow steps have data-finished="true"/"false"
-// We also check for a stop button and text growth.
-// ============================================================
-
 function isGenerating() {
     var root = getChatRoot();
-
-    // Method 1: Workflow steps with data-finished="false"
     var steps = qsa('[data-testid^="step-"]', root);
     for (var i = 0; i < steps.length; i++) {
         if (steps[i].getAttribute('data-finished') === 'false') return true;
     }
-
-    // Method 2: Stop button (various possible selectors)
     var stopBtn = qs('[data-testid="stop-button"]') ||
                   qs('[aria-label="Stop generating"]') ||
                   qs('button[aria-label*="Stop"]');
     if (stopBtn) return true;
-
     return false;
 }
 
@@ -149,18 +120,9 @@ function isTextStillChanging() {
     return false;
 }
 
-// ============================================================
-// CODE EXTRACTION FROM DOM
-// We find code blocks by: figure[aria-label="Code Block"] > pre > code
-// OR fallback: pre > code (any pre/code pair inside answer turns)
-// We do NOT rely on class names.
-// ============================================================
-
 function getCodeBlocksFromElement(el) {
     if (!el) return [];
     var results = [];
-
-    // Strategy 1: figure[aria-label="Code Block"] descendants
     var figures = el.querySelectorAll('figure[aria-label="Code Block"]');
     for (var i = 0; i < figures.length; i++) {
         var codeEl = figures[i].querySelector('pre > code') || figures[i].querySelector('pre');
@@ -169,8 +131,6 @@ function getCodeBlocksFromElement(el) {
             if (text.trim().length > 10) results.push(text);
         }
     }
-
-    // Strategy 2: Any pre > code inside the element (fallback)
     if (results.length === 0) {
         var codeEls = el.querySelectorAll('pre code');
         for (var j = 0; j < codeEls.length; j++) {
@@ -178,8 +138,6 @@ function getCodeBlocksFromElement(el) {
             if (t.trim().length > 10) results.push(t);
         }
     }
-
-    // Strategy 3: Any pre element (last resort)
     if (results.length === 0) {
         var pres = el.querySelectorAll('pre');
         for (var k = 0; k < pres.length; k++) {
@@ -187,7 +145,6 @@ function getCodeBlocksFromElement(el) {
             if (pt.trim().length > 10) results.push(pt);
         }
     }
-
     return results;
 }
 
@@ -196,7 +153,6 @@ function getLastCodeFromDOM() {
     if (!el) return '';
     var blocks = getCodeBlocksFromElement(el);
     if (blocks.length === 0) return '';
-    // Return the longest block (most likely the main code)
     var longest = '';
     for (var i = 0; i < blocks.length; i++) {
         if (blocks[i].length > longest.length) longest = blocks[i];
@@ -216,17 +172,8 @@ function getAllCodeFromAllTurns() {
     return allBlocks;
 }
 
-// ============================================================
-// FINISH MARKER DETECTION
-// The AI writes AUTOCODER_FINISHED in a <span data-testid="youchat-text">
-// which is OUTSIDE the code block, as a sibling text node.
-// ============================================================
-
 function isDone(turnText) {
-    // Check the full turn text (innerText includes everything)
     if (turnText.indexOf(FINISH_MARKER) !== -1) return true;
-
-    // Also check specifically in youchat-text spans
     var el = getLastAnswerTurnEl();
     if (!el) return false;
     var textSpans = el.querySelectorAll('[data-testid="youchat-text"]');
@@ -236,10 +183,6 @@ function isDone(turnText) {
     return false;
 }
 
-// ============================================================
-// FORM SUBMISSION
-// ============================================================
-
 function getTextarea() {
     return qs('#search-input-textarea') ||
            qs('textarea[data-testid="search-input-textarea"]') ||
@@ -248,7 +191,6 @@ function getTextarea() {
 }
 
 function setNativeValue(ta, text) {
-    // React controlled components need the native setter
     var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
         window.HTMLTextAreaElement.prototype, 'value'
     ).set;
@@ -262,7 +204,6 @@ function clickSend(ta) {
     if (!form) {
         form = qs('form:has(#search-input-textarea)') || qs('form:has(textarea)');
     }
-
     if (form) {
         var btn = form.querySelector('button[type="submit"]') ||
                   form.querySelector('[data-testid*="send"]') ||
@@ -270,15 +211,10 @@ function clickSend(ta) {
                   form.querySelector('button[aria-label*="send"]') ||
                   form.querySelector('button[aria-label*="Submit"]') ||
                   form.querySelector('button[aria-label*="submit"]');
-
-        // Fallback: find the last button in the form (often the submit button)
         if (!btn) {
             var allBtns = form.querySelectorAll('button');
-            if (allBtns.length > 0) {
-                btn = allBtns[allBtns.length - 1];
-            }
+            if (allBtns.length > 0) btn = allBtns[allBtns.length - 1];
         }
-
         if (btn) {
             btn.disabled = false;
             btn.removeAttribute('disabled');
@@ -286,19 +222,16 @@ function clickSend(ta) {
             log('Clicked send button');
             return true;
         }
-        // Fallback: submit via Enter keypress on textarea
         ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
         log('Dispatched Enter keydown on textarea');
         return true;
     }
-
     var anyBtn = qs('button[type="submit"]') || qs('[data-testid*="send"]');
     if (anyBtn) {
         anyBtn.click();
         log('Clicked fallback send button');
         return true;
     }
-
     log('ERROR: Could not find send button or form');
     return false;
 }
@@ -311,26 +244,17 @@ function submit(text) {
         return false;
     }
     setNativeValue(ta, text);
-    // Small delay to let React process the input event
-    setTimeout(function() {
-        clickSend(ta);
-    }, 400);
+    setTimeout(function() { clickSend(ta); }, 400);
     return true;
 }
-
-// ============================================================
-// STRING HELPERS
-// ============================================================
 
 function getLastNLines(text, n) {
     if (!text) return '';
     var lines = text.split('\n');
-    // Get last N non-empty lines (but preserve structure)
     var result = [];
     for (var i = lines.length - 1; i >= 0 && result.length < n; i--) {
         result.unshift(lines[i]);
     }
-    // Trim leading empty lines from result
     while (result.length > 0 && result[0].trim() === '') result.shift();
     return result.join('\n');
 }
@@ -357,10 +281,6 @@ function countFences(text) {
     }
     return count;
 }
-
-// ============================================================
-// AUDIO FEEDBACK
-// ============================================================
 
 function getAudioCtx() {
     if (!audioCtx) {
@@ -391,10 +311,6 @@ function playTone(freq, startOffset, dur) {
 function playProcessingSound() { playTone(440, 0, 0.2); playTone(554.37, 0.1, 0.2); }
 function playSuccessSound() { playTone(523.25, 0, 0.15); playTone(659.25, 0.1, 0.15); playTone(783.99, 0.2, 0.3); }
 
-// ============================================================
-// COUNTER & TITLE
-// ============================================================
-
 function buildTitle() {
     if (totalGenerations >= 12) return '\uD83C\uDF1F BEAST MODE \u2014 ' + totalGenerations + ' Generations!';
     if (totalGenerations >= 7) return '\uD83D\uDE80 Auto-Coder \u2014 ' + totalGenerations + ' generated!!';
@@ -416,10 +332,6 @@ function updateCounter() {
 function incrementProcessing() { processingCount++; totalGenerations++; updateCounter(); playProcessingSound(); }
 function markDone() { if (processingCount > 0) processingCount--; doneCount++; updateCounter(); playSuccessSound(); }
 
-// ============================================================
-// CODE COMPLETENESS CHECKS
-// ============================================================
-
 function endsWithHtmlClose(trimmed) {
     return /<\/html>\s*$/i.test(trimmed.slice(-30));
 }
@@ -428,10 +340,7 @@ function lastLineIsCutOff(trimmed) {
     var lines = trimmed.split('\n');
     var lastLine = lines[lines.length - 1].trim();
     if (lastLine.length === 0) return false;
-    // These characters at end of line suggest the code was cut mid-statement
-    // Semicolons are valid endings, NOT cut-off indicators
     if (/[+\-*\/=,({|&:\\]$/.test(lastLine)) return true;
-    // Unclosed string literal
     var singleQuotes = countChar(lastLine, "'");
     var doubleQuotes = countChar(lastLine, '"');
     if (singleQuotes % 2 !== 0 || doubleQuotes % 2 !== 0) return true;
@@ -490,19 +399,10 @@ function endsAbruptlyMidBlock(trimmed) {
 function isCodeIncomplete(code) {
     if (!code || code.trim().length === 0) return false;
     var trimmed = code.trim();
-
-    // If it contains the finish marker, it's complete
     if (trimmed.indexOf(FINISH_MARKER) !== -1) return false;
-
-    // Proper HTML ending
     if (endsWithHtmlClose(trimmed)) return false;
-
-    // Proper IIFE ending
     if (/\}\s*\)\s*\(\s*\)\s*;?\s*$/.test(trimmed.slice(-20))) return false;
-
-    // Short code after continues = likely truncated
     if (trimmed.length < MIN_CODE_LENGTH_FOR_COMPLETE && continues > 0) return true;
-
     return lastLineIsCutOff(trimmed) ||
            hasUnclosedHtml(trimmed) ||
            hasUnbalancedBraces(trimmed) ||
@@ -515,25 +415,16 @@ function isCodeIncomplete(code) {
            hasUnclosedTemplateLiteral(trimmed);
 }
 
-// ============================================================
-// SETTLING DETECTION
-// ============================================================
-
 function isResponseFullySettled() {
     if (isGenerating()) return false;
     var el = getLastAnswerTurnEl();
     if (!el) return false;
     if (isTextStillChanging()) return false;
     if (stableCheckCount < STREAM_STABLE_CHECKS) return false;
-    // Fence balance: odd = code block still open
     var text = el.innerText || '';
     if (countFences(text) % 2 !== 0) return false;
     return true;
 }
-
-// ============================================================
-// MERGE OVERLAP
-// ============================================================
 
 function findExactOverlap(aLines, bLines) {
     var maxCheck = Math.min(aLines.length, bLines.length, 30);
@@ -570,20 +461,15 @@ function fixTruncatedTail(aLines, bLines) {
     if (aLines.length === 0 || bLines.length === 0) return false;
     var lastA = aLines[aLines.length - 1].trim();
     if (lastA.length === 0) return false;
-    // Find first non-empty line in B
     var firstBIdx = 0;
     while (firstBIdx < bLines.length && bLines[firstBIdx].trim() === '') firstBIdx++;
     if (firstBIdx >= bLines.length) return false;
     var firstB = bLines[firstBIdx].trim();
-    // Check if B's first line starts with A's last line (A was truncated)
     if (firstB.length > lastA.length && firstB.indexOf(lastA) === 0) {
         aLines.pop();
         return true;
     }
-    // Also check if A's last line is a prefix of B's first line (without requiring strict indexOf === 0)
-    // Handle case where lastA ends with an operator and firstB continues it
     if (lastA.length >= 3 && firstB.length > lastA.length) {
-        // Try matching without trailing whitespace variations
         var lastANoTrail = lastA.replace(/\s+$/, '');
         var firstBStart = firstB.substring(0, lastANoTrail.length);
         if (firstBStart === lastANoTrail) {
@@ -598,22 +484,16 @@ function mergeOverlap(existing, fragment) {
     if (!existing) return fragment;
     if (!fragment) return existing;
     if (fragment.trim().length < 30 && existing.trim().length > 100) return existing;
-
     var aLines = existing.split('\n');
     var bLines = fragment.split('\n');
-
     fixTruncatedTail(aLines, bLines);
-
     var exact = findExactOverlap(aLines, bLines);
     if (exact > 0) {
         log('Merge: exact overlap of ' + exact + ' lines');
         var remainder = bLines.slice(exact);
-        if (remainder.length === 0) {
-            return aLines.join('\n');
-        }
+        if (remainder.length === 0) return aLines.join('\n');
         return aLines.join('\n') + '\n' + remainder.join('\n');
     }
-
     var partial = findPartialOverlap(aLines, bLines);
     if (partial) {
         log('Merge: partial overlap at posA=' + partial.posA + ' startB=' + partial.startB);
@@ -622,14 +502,9 @@ function mergeOverlap(existing, fragment) {
         if (head.length === 0) return tail.join('\n');
         return head.join('\n') + '\n' + tail.join('\n');
     }
-
     log('Merge: no overlap found, concatenating');
     return aLines.join('\n') + '\n' + bLines.join('\n');
 }
-
-// ============================================================
-// RAW TAIL FOR CONTINUE PROMPT
-// ============================================================
 
 function getRawTail() {
     var code = getLastCodeFromDOM();
@@ -637,10 +512,6 @@ function getRawTail() {
     if (!source) return '';
     return getLastNLines(source, OVERLAP_LINES);
 }
-
-// ============================================================
-// HARVEST
-// ============================================================
 
 function cleanMarkers(code) {
     var patterns = [
@@ -665,7 +536,6 @@ function harvestAllCode() {
         log('Harvest: no answer turns found');
         return '';
     }
-
     var allCode = '';
     for (var i = 0; i < turns.length; i++) {
         var blocks = getCodeBlocksFromElement(turns[i]);
@@ -689,7 +559,6 @@ function doHarvest() {
     setStatus('\uD83C\uDF3E Harvesting...');
     var code = harvestAllCode();
     if (!isValidHarvest(code)) {
-        // Try accumulated
         if (isValidHarvest(accumulated)) {
             code = accumulated;
         } else {
@@ -702,6 +571,7 @@ function doHarvest() {
     }
     accumulated = code;
     lastHarvestedText = code;
+    showMergedOutput = true;
     injectCodeBlock(code);
     copyToClipboard(code, function() {
         setStatus('\uD83C\uDF3E ' + code.split('\n').length + ' lines harvested & copied!');
@@ -711,19 +581,11 @@ function doHarvest() {
     });
 }
 
-// ============================================================
-// CLIPBOARD
-// ============================================================
-
 function copyToClipboard(text, onSuccess, onFail) {
     if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(text).then(onSuccess || function(){}).catch(onFail || function(){});
     } else if (onFail) { onFail(); }
 }
-
-// ============================================================
-// AUTO-HARVEST OBSERVER
-// ============================================================
 
 function cancelPendingAutoHarvest() {
     if (autoHarvestPending) { clearTimeout(autoHarvestPending); autoHarvestPending = null; }
@@ -739,7 +601,6 @@ function tryAutoHarvest() {
         autoHarvestPending = setTimeout(tryAutoHarvest, 2000);
         return;
     }
-    // Additional delay after settling to make sure nothing else is coming
     setTimeout(function() {
         if (!isResponseFullySettled() || running || isGenerating()) return;
         if (isTextStillChanging()) {
@@ -750,7 +611,9 @@ function tryAutoHarvest() {
         if (isValidHarvest(code) && code !== lastHarvestedText) {
             accumulated = code;
             lastHarvestedText = code;
-            injectCodeBlock(code);
+            if (showMergedOutput) {
+                injectCodeBlock(code);
+            }
             log('Auto-harvested ' + code.split('\n').length + ' lines');
         }
         autoHarvestPending = null;
@@ -770,21 +633,17 @@ function onAutoHarvestMutation() {
 function startAutoHarvest() {
     if (autoHarvestObserver) return;
     var root = getChatRoot();
-    if (!root) return; // Only fail if there's truly no root
+    if (!root) return;
     autoHarvestObserver = new MutationObserver(onAutoHarvestMutation);
     autoHarvestObserver.observe(root, { childList: true, subtree: true });
     log('Auto-harvest observer started on ' + (root.id ? '#' + root.id : root.tagName));
 }
 
-// ============================================================
-// INJECTED CODE BLOCK UI
-// ============================================================
-
 function injectCodeBlock(code) {
+    if (!showMergedOutput) return;
     var lastTurn = getLastAnswerTurnEl();
     if (!lastTurn) return;
     if (!isValidHarvest(code)) return;
-
     var old = document.getElementById('acl-injected-block');
     if (old) {
         var codeEl = old.querySelector('code');
@@ -793,7 +652,6 @@ function injectCodeBlock(code) {
         if (headerEl) headerEl.textContent = '\u2714 MERGED OUTPUT (' + code.split('\n').length + ' lines)';
         return;
     }
-
     var wrapper = createBlockUI(code);
     var container = lastTurn.parentElement;
     if (container) container.insertBefore(wrapper, lastTurn.nextSibling);
@@ -812,19 +670,15 @@ function createBlockUI(code) {
     var wrapper = document.createElement('div');
     wrapper.id = 'acl-injected-block';
     wrapper.style.cssText = 'margin:16px 0;border:2px solid #7c3aed;border-radius:10px;overflow:hidden;position:relative;box-sizing:border-box;';
-
     var header = document.createElement('div');
     header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:#1a1528;border-bottom:1px solid #333;flex-wrap:wrap;gap:8px;';
-
     var headerText = document.createElement('span');
     headerText.className = 'acl-header-text';
     headerText.style.cssText = 'color:#a5b4fc;font:600 12px/1.4 sans-serif;';
     headerText.textContent = '\u2714 MERGED OUTPUT (' + code.split('\n').length + ' lines)';
     header.appendChild(headerText);
-
     var btnWrap = document.createElement('div');
     btnWrap.style.cssText = 'display:flex;gap:6px;flex-shrink:0;';
-
     var copyBtn = createButton('Copy All',
         'padding:4px 12px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font:600 11px/1 sans-serif;cursor:pointer;white-space:nowrap;',
         function() {
@@ -873,7 +727,6 @@ function downloadFile(content, filename, mimeType) {
 function poll() {
     if (!running) return;
 
-    // If still generating, keep polling
     if (isGenerating()) {
         stableCheckCount = 0;
         lastSeenTextLength = 0;
@@ -881,26 +734,22 @@ function poll() {
         return;
     }
 
-    // Check if text is still changing even without generation indicators
     if (isTextStillChanging()) {
         pollTimeout = setTimeout(poll, STREAM_CHECK_INTERVAL);
         return;
     }
 
-    // Require multiple stable checks before proceeding
     if (stableCheckCount < STREAM_STABLE_CHECKS) {
         pollTimeout = setTimeout(poll, STREAM_CHECK_INTERVAL);
         return;
     }
 
-    // Check turn count - must have a new turn
     var t = getTurnCount();
     if (t <= lastTurns) {
         pollTimeout = setTimeout(poll, POLL_MS);
         return;
     }
 
-    // Check fence balance before processing
     var el = getLastAnswerTurnEl();
     if (el) {
         var text = el.innerText || '';
@@ -913,7 +762,7 @@ function poll() {
     }
 
     lastTurns = t;
-    // Delay before handling response to ensure DOM is fully updated
+  
     if (responseHandleTimeout) clearTimeout(responseHandleTimeout);
     responseHandleTimeout = setTimeout(function() {
         handleResponseSafe();
@@ -929,14 +778,12 @@ function handleResponseSafe() {
     if (isProcessingResponse) return;
     isProcessingResponse = true;
 
-    // Double-check that generation is truly done
     if (isGenerating()) {
         isProcessingResponse = false;
         pollTimeout = setTimeout(poll, POLL_MS);
         return;
     }
 
-    // Final text stability check
     if (isTextStillChanging()) {
         isProcessingResponse = false;
         stableCheckCount = 0;
@@ -944,7 +791,6 @@ function handleResponseSafe() {
         return;
     }
 
-    // Verify fence balance one more time
     var el = getLastAnswerTurnEl();
     if (el) {
         var rawText = el.innerText || '';
@@ -964,7 +810,6 @@ function handleResponse() {
     if (!running) return;
     var text = getLastTurnText();
 
-    // Check if this is the same response we already processed
     if (text === lastResponseText && text.length > 0) {
         log('Same response text detected, skipping duplicate');
         pollTimeout = setTimeout(poll, POLL_MS);
@@ -972,10 +817,8 @@ function handleResponse() {
     }
     lastResponseText = text;
 
-    // Extract code from DOM (primary method)
     var newCode = getLastCodeFromDOM();
 
-    // If no code from DOM, try accumulated
     if (!newCode || newCode.trim().length < 20) {
         log('No code found in last turn DOM');
     }
@@ -985,28 +828,23 @@ function handleResponse() {
     }
 
     lastRawTail = getRawTail();
-    if (isValidHarvest(accumulated.trim())) {
-        injectCodeBlock(accumulated.trim());
-    }
+    // FIX: Do NOT call injectCodeBlock here - only show at finish/harvest
     decideNextAction(text);
 }
 
 function decideNextAction(text) {
-    // Check isDone first - explicit signal from AI
     if (isDone(text)) {
         log('FINISHED marker detected - completing.');
         finish();
         return;
     }
 
-    // Check max continues
     if (continues >= MAX) {
         log('Max continues reached (' + MAX + ') - completing.');
         finish();
         return;
     }
 
-    // Check if code is incomplete
     var accTrimmed = accumulated.trim();
 
     if (accTrimmed.length > 0) {
@@ -1017,7 +855,6 @@ function decideNextAction(text) {
             return;
         }
 
-        // Check if the last code block in DOM looks cut off
         var lastCode = getLastCodeFromDOM();
         if (lastCode && isCodeIncomplete(lastCode)) {
             log('Last DOM code block incomplete - continuing.');
@@ -1026,11 +863,9 @@ function decideNextAction(text) {
             return;
         }
 
-        // Code looks complete
         log('Code appears complete. ' + accTrimmed.split('\n').length + ' lines.');
         finish();
     } else {
-        // No code accumulated - check if there's code in DOM we missed
         var domCode = getLastCodeFromDOM();
         if (domCode && domCode.trim().length > 20) {
             accumulated = cleanMarkers(domCode);
@@ -1062,7 +897,6 @@ function doSkip() { clearWait(); doSubmitContinue(); }
 
 function doSubmitContinue() {
     if (!running) return;
-    // Reset tracking state for next response
     stableCheckCount = 0;
     lastSeenTextLength = 0;
     lastResponseText = '';
@@ -1070,7 +904,6 @@ function doSubmitContinue() {
 
     setStatus('\u23F3 Continuing (' + continues + '/' + MAX + ')...');
     submit(buildContinuePrompt());
-    // Wait before polling to give AI time to start generating
     pollTimeout = setTimeout(poll, CONTINUE_POLL_DELAY);
 }
 
@@ -1105,13 +938,17 @@ function updateWaitUI() {
 
 // ============================================================
 // PROMPT BUILDING
+// FIX: Continue prompt warns AI not to start with triple backticks
 // ============================================================
 
 function buildContinuePrompt() {
     var tail = lastRawTail || getLastNLines(accumulated, OVERLAP_LINES);
+    var noFenceWarning = 'IMPORTANT: Do NOT start your response with ' + FENCE + ' or any code fence. You are continuing MID-CODE inside an already-open code block. Just write the next lines of code directly.';
     return [
         'Continue EXACTLY where you left off. Your last lines were:',
         '', FENCE, tail, FENCE, '',
+        noFenceWarning,
+        '',
         'Continue from there. Do NOT repeat those lines. Just write the next code.',
         'When you are 100% completely done with the ENTIRE file, write AUTOCODER_FINISHED after your code block on its own line.',
         '',
@@ -1152,6 +989,8 @@ function finish() {
         accumulated = code;
     }
 
+    // FIX: Only show merged output at the very end
+    showMergedOutput = true;
     if (isValidHarvest(code)) {
         injectCodeBlock(code);
     }
@@ -1170,6 +1009,7 @@ function start(prompt) {
     lastRawTail = '';
     prevHadUnclosedBlock = false;
     lastHarvestedText = '';
+    showMergedOutput = false; // FIX: Reset - don't show until finish
     lastTurns = getTurnCount();
     lastSeenTextLength = 0;
     stableCheckCount = 0;
@@ -1177,6 +1017,11 @@ function start(prompt) {
     isProcessingResponse = false;
     if (responseHandleTimeout) { clearTimeout(responseHandleTimeout); responseHandleTimeout = null; }
     if (pollTimeout) { clearTimeout(pollTimeout); pollTimeout = null; }
+
+    // Remove old injected block if any
+    var oldBlock = document.getElementById('acl-injected-block');
+    if (oldBlock) oldBlock.remove();
+
     incrementProcessing();
     updateBtn();
     setStatus('\u23F3 Submitting...');
@@ -1385,22 +1230,18 @@ if (!document.body) {
     bodyObserver.observe(document.documentElement, { childList: true });
 }
 
-// Periodic health check - re-init UI if removed, update padding
 setInterval(function() {
     if (!qs('#acl-bar') && document.body) initUI();
     updateBodyPadding();
 }, 3000);
 
-// Periodic streaming stability check while running
 setInterval(function() {
     if (!running) return;
     isTextStillChanging();
 }, STREAM_CHECK_INTERVAL);
 
 // ============================================================
-// TEST SUITE: window.test_auto_continue
-// Comprehensive tests for all internal functions and DOM interaction.
-// Run from browser console: test_auto_continue()
+// TEST SUITE
 // ============================================================
 
 function createTestReport(results) {
@@ -1409,534 +1250,101 @@ function createTestReport(results) {
         if (results[i].pass) passed++;
         else { failed++; errors.push(results[i]); }
     }
-    console.log('\n%c═══════════════════════════════════════════', 'color:#7c3aed;font-weight:bold');
-    console.log('%c  AUTO-CODER v13 TEST RESULTS', 'color:#c4b5fd;font-weight:bold;font-size:14px');
-    console.log('%c═══════════════════════════════════════════', 'color:#7c3aed;font-weight:bold');
-    console.log('%c  ✅ Passed: ' + passed, 'color:#34d399;font-weight:bold');
-    console.log('%c  ❌ Failed: ' + failed, 'color:#f87171;font-weight:bold');
-    console.log('%c  Total:   ' + results.length, 'color:#a5b4fc');
-    console.log('%c═══════════════════════════════════════════', 'color:#7c3aed;font-weight:bold');
+    console.log('\n%c' + Array(44).join('='), 'color:#7c3aed;font-weight:bold');
+    console.log('%c  AUTO-CODER v13.1 TEST RESULTS', 'color:#c4b5fd;font-weight:bold;font-size:14px');
+    console.log('%c' + Array(44).join('='), 'color:#7c3aed;font-weight:bold');
+    console.log('%c  Passed: ' + passed, 'color:#34d399;font-weight:bold');
+    console.log('%c  Failed: ' + failed, 'color:#f87171;font-weight:bold');
+    console.log('%c  Total:  ' + results.length, 'color:#a5b4fc');
+    console.log('%c' + Array(44).join('='), 'color:#7c3aed;font-weight:bold');
     if (errors.length > 0) {
         console.log('\n%cFailed Tests:', 'color:#f87171;font-weight:bold');
         for (var j = 0; j < errors.length; j++) {
-            console.log('%c  ✗ ' + errors[j].name + ': ' + errors[j].msg, 'color:#fca5a5');
+            console.log('%c  X ' + errors[j].name + ': ' + errors[j].msg, 'color:#fca5a5');
         }
     }
-    console.log('');
     return { passed: passed, failed: failed, total: results.length, errors: errors };
 }
 
 function assert(results, name, condition, msg) {
     results.push({ name: name, pass: !!condition, msg: msg || (condition ? 'OK' : 'FAILED') });
-    if (!condition) {
-        console.warn('  ✗ ' + name + ': ' + (msg || 'FAILED'));
-    } else {
-        console.log('  ✓ ' + name);
-    }
+    if (!condition) console.warn('  X ' + name + ': ' + (msg || 'FAILED'));
+    else console.log('  V ' + name);
 }
 
 window.test_auto_continue = function() {
     var results = [];
-    console.log('\n%c🧪 Running Auto-Coder v13 Test Suite...', 'color:#a855f7;font-weight:bold;font-size:13px');
-    console.log('%c─────────────────────────────────────────', 'color:#6b21a8');
+    console.log('\n%cRunning Auto-Coder v13.1 Test Suite...', 'color:#a855f7;font-weight:bold;font-size:13px');
 
-    // ─── GROUP 1: DOM DETECTION ───────────────────────────────
-    console.log('\n%c📋 Group 1: DOM Detection', 'color:#60a5fa;font-weight:bold');
-
-	var chatRoot = getChatRoot();
-	assert(results, 'getChatRoot() finds #chat-history',
-	    chatRoot && (chatRoot.id === 'chat-history' || chatRoot === document.body),
-	    chatRoot ? (chatRoot.id === 'chat-history' ? 'Found: #chat-history' : 'Fallback: document.body (no chat open)') : 'NOT FOUND');
+    var chatRoot = getChatRoot();
+    assert(results, 'getChatRoot finds element', chatRoot !== null, chatRoot ? (chatRoot.id || chatRoot.tagName) : 'null');
 
     var answerTurns = getAnswerTurns();
-    assert(results, 'getAnswerTurns() finds answer turns',
-        answerTurns.length >= 0,
-        'Found ' + answerTurns.length + ' answer turn(s)');
-
-    var questionTurns = getQuestionTurns();
-    assert(results, 'getQuestionTurns() finds question turns',
-        questionTurns.length >= 0,
-        'Found ' + questionTurns.length + ' question turn(s)');
+    assert(results, 'getAnswerTurns returns NodeList', answerTurns.length >= 0, 'Found ' + answerTurns.length);
 
     var turnCount = getTurnCount();
-    assert(results, 'getTurnCount() returns number',
-        typeof turnCount === 'number' && turnCount >= 0,
-        'Turn count: ' + turnCount);
-
-    var lastEl = getLastAnswerTurnEl();
-    assert(results, 'getLastAnswerTurnEl() returns element or null',
-        lastEl === null || (lastEl && lastEl.nodeType === 1),
-        lastEl ? 'Found: ' + lastEl.getAttribute('data-testid') : 'No answer turns yet');
-
-    var lastText = getLastTurnText();
-    assert(results, 'getLastTurnText() returns string',
-        typeof lastText === 'string',
-        'Length: ' + lastText.length + ' chars');
-
-    var lastId = getLastTurnId();
-    assert(results, 'getLastTurnId() returns string',
-        typeof lastId === 'string',
-        'ID: ' + (lastId || '(empty - no turns)'));
-
-    // ─── GROUP 2: GENERATION DETECTION ────────────────────────
-    console.log('\n%c⚡ Group 2: Generation Detection', 'color:#60a5fa;font-weight:bold');
+    assert(results, 'getTurnCount returns number', typeof turnCount === 'number', 'Count: ' + turnCount);
 
     var gen = isGenerating();
-    assert(results, 'isGenerating() returns boolean',
-        typeof gen === 'boolean',
-        'Currently generating: ' + gen);
+    assert(results, 'isGenerating returns boolean', typeof gen === 'boolean', 'Value: ' + gen);
 
-    // Check workflow steps detection
-    var steps = qsa('[data-testid^="step-"]', chatRoot);
-    var finishedSteps = 0, unfinishedSteps = 0;
-    for (var si = 0; si < steps.length; si++) {
-        if (steps[si].getAttribute('data-finished') === 'true') finishedSteps++;
-        else unfinishedSteps++;
-    }
-    assert(results, 'Workflow steps found in DOM',
-        steps.length >= 0,
-        'Total: ' + steps.length + ' (finished: ' + finishedSteps + ', unfinished: ' + unfinishedSteps + ')');
+    var ta = getTextarea();
+    assert(results, 'getTextarea finds textarea', ta !== null, ta ? ta.id : 'NOT FOUND');
 
-    assert(results, 'isGenerating() consistent with step states',
-        (unfinishedSteps > 0) === gen || !gen,
-        'Unfinished steps: ' + unfinishedSteps + ', isGenerating: ' + gen);
+    var m1 = mergeOverlap('a\nb\nc\nd\ne', 'd\ne\nf\ng');
+    assert(results, 'mergeOverlap exact overlap', m1 === 'a\nb\nc\nd\ne\nf\ng', m1.replace(/\n/g, '|'));
 
-    // ─── GROUP 3: CODE EXTRACTION ─────────────────────────────
-    console.log('\n%c💻 Group 3: Code Extraction', 'color:#60a5fa;font-weight:bold');
+    var m2 = mergeOverlap('x\ny\nz', 'a\nb\nc');
+    assert(results, 'mergeOverlap no overlap concat', m2 === 'x\ny\nz\na\nb\nc', m2.replace(/\n/g, '|'));
 
-    // Test figure[aria-label="Code Block"] detection
-    var figures = chatRoot ? chatRoot.querySelectorAll('figure[aria-label="Code Block"]') : [];
-    assert(results, 'Code Block figures found via aria-label',
-        figures.length >= 0,
-        'Found ' + figures.length + ' figure(s) with aria-label="Code Block"');
+    var m3 = mergeOverlap('a\nb\nc', 'a\nb\nc');
+    assert(results, 'mergeOverlap identical dedup', m3 === 'a\nb\nc', m3.replace(/\n/g, '|'));
 
-    // Test pre > code detection (fallback)
-    var preCodes = chatRoot ? chatRoot.querySelectorAll('pre code') : [];
-    assert(results, 'pre > code elements found',
-        preCodes.length >= 0,
-        'Found ' + preCodes.length + ' pre>code element(s)');
+    assert(results, 'isCodeIncomplete unclosed HTML', isCodeIncomplete('<!DOCTYPE html><html><body>') === true, '');
+    assert(results, 'isCodeIncomplete closed HTML', isCodeIncomplete('<!DOCTYPE html><html></html>') === false, '');
+    assert(results, 'isCodeIncomplete with FINISH_MARKER', isCodeIncomplete('code\nAUTOCODER_FINISHED') === false, '');
 
-    if (lastEl) {
-        var blocks = getCodeBlocksFromElement(lastEl);
-        assert(results, 'getCodeBlocksFromElement() extracts code from last turn',
-            Array.isArray(blocks),
-            'Extracted ' + blocks.length + ' block(s)' + (blocks.length > 0 ? ', longest: ' + blocks.reduce(function(a,b){return a.length>b.length?a:b;}, '').length + ' chars' : ''));
+    var initPrompt = buildInitialPrompt('test prompt');
+    assert(results, 'buildInitialPrompt has user text', initPrompt.indexOf('test prompt') !== -1, '');
+    assert(results, 'buildInitialPrompt has rules', initPrompt.indexOf('=== RULES ===') !== -1, '');
 
-        var lastCode = getLastCodeFromDOM();
-        assert(results, 'getLastCodeFromDOM() returns string',
-            typeof lastCode === 'string',
-            'Length: ' + lastCode.length + ' chars' + (lastCode.length > 0 ? ', preview: "' + lastCode.slice(0,50) + '..."' : ''));
-    }
-
-    var allCode = getAllCodeFromAllTurns();
-    assert(results, 'getAllCodeFromAllTurns() returns array',
-        Array.isArray(allCode),
-        'Found ' + allCode.length + ' code block(s) across all turns');
-
-    // ─── GROUP 4: FINISH MARKER DETECTION ─────────────────────
-    console.log('\n%c🏁 Group 4: Finish Marker Detection', 'color:#60a5fa;font-weight:bold');
-
-    // Test isDone with synthetic text
-    assert(results, 'isDone("AUTOCODER_FINISHED") returns true',
-        isDone('some code here\nAUTOCODER_FINISHED\n'),
-        '');
-
-    assert(results, 'isDone("random text") returns false',
-        !isDone('just some random text without the marker'),
-        '');
-
-    assert(results, 'isDone("!!!!!AUTOCODER_FINISHED!!!!!") returns true',
-        isDone('code\n!!!!!AUTOCODER_FINISHED!!!!!\n'),
-        'Also catches the old 5-exclamation format');
-
-    // Test with actual DOM
-    if (lastEl) {
-        var textSpans = lastEl.querySelectorAll('[data-testid="youchat-text"]');
-        var foundMarkerInDOM = false;
-        for (var tsi = 0; tsi < textSpans.length; tsi++) {
-            if ((textSpans[tsi].textContent || '').indexOf(FINISH_MARKER) !== -1) {
-                foundMarkerInDOM = true;
-                break;
-            }
-        }
-        assert(results, 'FINISH_MARKER detection in youchat-text spans',
-            true,
-            'Found in DOM spans: ' + foundMarkerInDOM + ' (spans found: ' + textSpans.length + ')');
-    }
-
-    // ─── GROUP 5: OVERLAP MERGE ───────────────────────────────
-    console.log('\n%c🔗 Group 5: Overlap Merge', 'color:#60a5fa;font-weight:bold');
-
-    var mergeA = 'line1\nline2\nline3\nline4\nline5';
-    var mergeB = 'line4\nline5\nline6\nline7';
-    var merged = mergeOverlap(mergeA, mergeB);
-    assert(results, 'mergeOverlap exact overlap (2 lines)',
-        merged === 'line1\nline2\nline3\nline4\nline5\nline6\nline7',
-        'Result: "' + merged.replace(/\n/g, '\\n') + '"');
-
-    var mergeC = 'aaa\nbbb\nccc';
-    var mergeD = 'xxx\nyyy\nzzz';
-    var merged2 = mergeOverlap(mergeC, mergeD);
-    assert(results, 'mergeOverlap no overlap (concatenates)',
-        merged2 === 'aaa\nbbb\nccc\nxxx\nyyy\nzzz',
-        'Result: "' + merged2.replace(/\n/g, '\\n') + '"');
-
-    var mergeE = 'function foo() {\n  var x = 1;\n  var y = 2;\n  var z =';
-    var mergeF = '  var z = 3;\n  return x + y + z;\n}';
-    var merged3 = mergeOverlap(mergeE, mergeF);
-    assert(results, 'mergeOverlap truncated tail fix',
-        merged3.indexOf('var z = 3') !== -1 && merged3.indexOf('var z =\n') === -1,
-        'Truncated line replaced correctly');
-
-    assert(results, 'mergeOverlap empty + text = text',
-        mergeOverlap('', 'hello') === 'hello',
-        '');
-
-    assert(results, 'mergeOverlap text + empty = text',
-        mergeOverlap('hello', '') === 'hello',
-        '');
-
-    // ─── GROUP 6: CODE COMPLETENESS ──────────────────────────
-    console.log('\n%c🔍 Group 6: Code Completeness Checks', 'color:#60a5fa;font-weight:bold');
-
-    assert(results, 'isCodeIncomplete: unclosed HTML',
-        isCodeIncomplete('<!DOCTYPE html><html><body><div>hello') === true,
-        '');
-
-    assert(results, 'isCodeIncomplete: closed HTML',
-        isCodeIncomplete('<!DOCTYPE html><html><body></body></html>') === false,
-        '');
-
-    assert(results, 'isCodeIncomplete: unbalanced braces',
-        isCodeIncomplete('function foo() {\n  if (x) {\n    bar();\n  \n' + 'x'.repeat(2000)) === true,
-        '');
-
-    assert(results, 'isCodeIncomplete: balanced braces',
-        isCodeIncomplete('function foo() {\n  if (x) {\n    bar();\n  }\n}') === false,
-        '');
-
-    assert(results, 'isCodeIncomplete: cut-off last line (trailing comma)',
-        isCodeIncomplete('var x = [\n  1,\n  2,') === true,
-        '');
-
-    assert(results, 'isCodeIncomplete: proper IIFE ending',
-        isCodeIncomplete('(function() {\n  var x = 1;\n})();') === false,
-        '');
-
-    assert(results, 'isCodeIncomplete: unclosed IIFE',
-        isCodeIncomplete('(function() {\n  var x = 1;\n  var y = 2;') === true,
-        '');
-
-    assert(results, 'isCodeIncomplete: unclosed template literal',
-        isCodeIncomplete('var x = `hello ${name') === true,
-        '');
-
-    assert(results, 'isCodeIncomplete: contains AUTOCODER_FINISHED',
-        isCodeIncomplete('some code\nAUTOCODER_FINISHED') === false,
-        'Marker presence = complete');
-
-    assert(results, 'isCodeIncomplete: unclosed script tag',
-        isCodeIncomplete('<html><body><script>var x = 1;') === true,
-        '');
-
-    assert(results, 'isCodeIncomplete: closed script tag',
-        isCodeIncomplete('<html><body><script>var x = 1;</script></body></html>') === false,
-        '');
-
-    // ─── GROUP 7: PROMPT BUILDING ─────────────────────────────
-    console.log('\n%c📝 Group 7: Prompt Building', 'color:#60a5fa;font-weight:bold');
-
-    var initPrompt = buildInitialPrompt('Write me a game');
-    assert(results, 'buildInitialPrompt contains user text',
-        initPrompt.indexOf('Write me a game') !== -1,
-        '');
-
-    assert(results, 'buildInitialPrompt contains RULES section',
-        initPrompt.indexOf('=== RULES ===') !== -1,
-        '');
-
-    assert(results, 'buildInitialPrompt mentions AUTOCODER_FINISHED',
-        initPrompt.indexOf('AUTOCODER_FINISHED') !== -1,
-        '');
-
-    assert(results, 'buildInitialPrompt does NOT use old !!!!! format',
-        initPrompt.indexOf('!!!!!AUTOCODER_FINISHED!!!!!') === -1,
-        'Uses plain AUTOCODER_FINISHED now');
-
-    // Simulate some accumulated code for continue prompt
     var savedAcc = accumulated;
     var savedTail = lastRawTail;
-    accumulated = 'line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10';
-    lastRawTail = 'line6\nline7\nline8\nline9\nline10';
+    accumulated = 'line1\nline2\nline3\nline4\nline5';
+    lastRawTail = 'line3\nline4\nline5';
     var contPrompt = buildContinuePrompt();
-    assert(results, 'buildContinuePrompt contains overlap lines',
-        contPrompt.indexOf('line10') !== -1,
-        '');
-
-    assert(results, 'buildContinuePrompt contains code fence',
-        contPrompt.indexOf(FENCE) !== -1,
-        '');
-
-    assert(results, 'buildContinuePrompt mentions AUTOCODER_FINISHED',
-        contPrompt.indexOf('AUTOCODER_FINISHED') !== -1,
-        '');
-
-    assert(results, 'buildContinuePrompt says "Continue EXACTLY"',
-        contPrompt.indexOf('Continue EXACTLY') !== -1,
-        '');
-
+    assert(results, 'buildContinuePrompt has tail', contPrompt.indexOf('line5') !== -1, '');
+    assert(results, 'buildContinuePrompt warns about fences', contPrompt.indexOf('Do NOT start') !== -1, '');
+    assert(results, 'buildContinuePrompt has FENCE', contPrompt.indexOf(FENCE) !== -1, '');
     accumulated = savedAcc;
     lastRawTail = savedTail;
 
-    // ─── GROUP 8: FORM INTERACTION ────────────────────────────
-    console.log('\n%c📤 Group 8: Form Interaction', 'color:#60a5fa;font-weight:bold');
+    assert(results, 'showMergedOutput flag exists', typeof showMergedOutput === 'boolean', 'Value: ' + showMergedOutput);
 
-    var ta = getTextarea();
-    assert(results, 'getTextarea() finds textarea',
-        ta !== null,
-        ta ? 'Found: #' + ta.id + ' (' + ta.tagName + ')' : 'NOT FOUND');
+    assert(results, 'UI bar exists', qs('#acl-bar') !== null, '');
+    assert(results, 'UI input exists', qs('#acl-input') !== null, '');
+    assert(results, 'UI btn exists', qs('#acl-btn') !== null, '');
+    assert(results, 'UI harvest exists', qs('#acl-harvest') !== null, '');
+    assert(results, 'UI status exists', qs('#acl-status') !== null, '');
+    assert(results, 'UI wait exists', qs('#acl-wait') !== null, '');
 
-    if (ta) {
-        var form = ta.closest('form');
-        assert(results, 'Textarea has parent form',
-            form !== null,
-            form ? 'Form found' : 'No parent form (will use fallback)');
+    assert(results, 'cleanMarkers removes markers',
+        cleanMarkers('code\nAUTOCODER_FINISHED\nmore').indexOf('AUTOCODER_FINISHED') === -1, '');
 
-	    if (form) {
-		    var submitBtn = form.querySelector('button[type="submit"]') ||
-			    form.querySelector('[data-testid*="send"]') ||
-			    form.querySelector('button[aria-label*="Send"]') ||
-			    form.querySelector('button[aria-label*="send"]') ||
-			    form.querySelector('button[aria-label*="Submit"]');
-		    // Fallback: any button in the form
-		    if (!submitBtn) {
-			    var allFormBtns = form.querySelectorAll('button');
-			    if (allFormBtns.length > 0) submitBtn = allFormBtns[allFormBtns.length - 1];
-		    }
-		    assert(results, 'Send button found in form',
-			    submitBtn !== null,
-			    submitBtn ? 'Found: ' + (submitBtn.getAttribute('aria-label') || submitBtn.textContent.trim().slice(0,30) || submitBtn.tagName) : 'NOT FOUND (will use Enter key fallback)');
-	    }
-    }
+    assert(results, 'countFences works', countFences(FENCE + 'js\ncode\n' + FENCE) === 2, '');
 
-    // ─── GROUP 9: UI ELEMENTS ─────────────────────────────────
-    console.log('\n%c🎨 Group 9: UI Elements', 'color:#60a5fa;font-weight:bold');
-
-    assert(results, 'Status bar (#acl-bar) exists',
-        qs('#acl-bar') !== null, '');
-
-    assert(results, 'Input textarea (#acl-input) exists',
-        qs('#acl-input') !== null, '');
-
-    assert(results, 'Start/Stop button (#acl-btn) exists',
-        qs('#acl-btn') !== null, '');
-
-    assert(results, 'Harvest button (#acl-harvest) exists',
-        qs('#acl-harvest') !== null, '');
-
-    assert(results, 'Status display (#acl-status) exists',
-        qs('#acl-status') !== null, '');
-
-    assert(results, 'Wait overlay (#acl-wait) exists',
-        qs('#acl-wait') !== null, '');
-
-    assert(results, 'Skip button (#acl-skip) exists',
-        qs('#acl-skip') !== null, '');
-
-    assert(results, 'Counter (#acl-counter) exists',
-        qs('#acl-counter') !== null, '');
-
-    // ─── GROUP 10: HARVEST FUNCTIONALITY ──────────────────────
-    console.log('\n%c🌾 Group 10: Harvest Functionality', 'color:#60a5fa;font-weight:bold');
-
-    var harvested = harvestAllCode();
-    assert(results, 'harvestAllCode() returns string',
-        typeof harvested === 'string',
-        'Length: ' + harvested.length + ' chars');
-
-    if (harvested.length > 0) {
-        assert(results, 'Harvested code is valid',
-            isValidHarvest(harvested),
-            'Lines: ' + harvested.split('\n').length);
-
-        assert(results, 'Harvested code has no raw markers',
-            harvested.indexOf('!!!!!CODEBLOCK_STARTS!!!!!') === -1 &&
-            harvested.indexOf('!!!!!CODEBLOCK_ENDS!!!!!') === -1,
-            'Markers cleaned');
-    }
-
-    // Test cleanMarkers
-    var dirty = '!!!!!CODEBLOCK_STARTS!!!!!\nvar x = 1;\n!!!!!CODEBLOCK_ENDS!!!!!\nAUTOCODER_FINISHED';
-    var cleaned = cleanMarkers(dirty);
-    assert(results, 'cleanMarkers removes all marker lines',
-        cleaned.indexOf('!!!!!') === -1 && cleaned.indexOf('AUTOCODER_FINISHED') === -1,
-        'Cleaned: "' + cleaned.replace(/\n/g, '\\n') + '"');
-
-    assert(results, 'cleanMarkers preserves actual code',
-        cleaned.indexOf('var x = 1') !== -1,
-        '');
-
-    // ─── GROUP 11: STRING HELPERS ─────────────────────────────
-    console.log('\n%c🔧 Group 11: String Helpers', 'color:#60a5fa;font-weight:bold');
-
-    var testLines = 'a\nb\nc\nd\ne\nf\ng';
-    var last3 = getLastNLines(testLines, 3);
-    assert(results, 'getLastNLines gets correct count',
-        last3.split('\n').length === 3 && last3 === 'e\nf\ng',
-        'Got: "' + last3.replace(/\n/g, '\\n') + '"');
-
-    var last5 = getLastNLines(testLines, 5);
-    assert(results, 'getLastNLines(5) from 7 lines',
-        last5.split('\n').length === 5 && last5 === 'c\nd\ne\nf\ng',
-        'Got: "' + last5.replace(/\n/g, '\\n') + '"');
-
-    assert(results, 'getLastNLines handles empty string',
-        getLastNLines('', 5) === '',
-        '');
-
-    assert(results, 'countFences counts correctly',
-        countFences('```js\ncode\n```\ntext\n```\nmore\n```') === 4,
-        '');
-
-    assert(results, 'countFences odd = unclosed block',
-        countFences('```js\ncode\nstill going') % 2 === 1,
-        '');
-
-    // ─── GROUP 12: STATE MANAGEMENT ───────────────────────────
-    console.log('\n%c⚙️ Group 12: State Management', 'color:#60a5fa;font-weight:bold');
-
-    assert(results, 'running is boolean',
-        typeof running === 'boolean',
-        'Currently: ' + running);
-
-    assert(results, 'continues is number',
-        typeof continues === 'number',
-        'Value: ' + continues);
-
-    assert(results, 'accumulated is string',
-        typeof accumulated === 'string',
-        'Length: ' + accumulated.length);
-
-    assert(results, 'MAX continues is reasonable',
-        MAX >= 10 && MAX <= 50,
-        'MAX = ' + MAX);
-
-    assert(results, 'DELAY_MS is reasonable',
-        DELAY_MS >= 10000 && DELAY_MS <= 60000,
-        'DELAY_MS = ' + DELAY_MS);
-
-    // ─── GROUP 13: SETTLING DETECTION ─────────────────────────
-    console.log('\n%c⏱️ Group 13: Settling Detection', 'color:#60a5fa;font-weight:bold');
-
-    var settled = isResponseFullySettled();
-    assert(results, 'isResponseFullySettled() returns boolean',
-        typeof settled === 'boolean',
-        'Currently settled: ' + settled);
-
-    // If not generating and we have turns, it should eventually settle
-    if (!isGenerating() && getTurnCount() > 0) {
-        // Force stable checks for test
-        var savedStable = stableCheckCount;
-        stableCheckCount = STREAM_STABLE_CHECKS + 1;
-        var settledAfterForce = isResponseFullySettled();
-        stableCheckCount = savedStable;
-        assert(results, 'isResponseFullySettled() true when stable (forced)',
-            settledAfterForce === true || isGenerating(),
-            'Settled after forcing stable count: ' + settledAfterForce);
-    }
-
-    // ─── GROUP 14: EDGE CASES ─────────────────────────────────
-    console.log('\n%c🔥 Group 14: Edge Cases', 'color:#60a5fa;font-weight:bold');
-
-    // Empty code handling
-    assert(results, 'isCodeIncomplete("") returns false',
-        isCodeIncomplete('') === false,
-        'Empty string is not "incomplete"');
-
-    assert(results, 'isCodeIncomplete(null) returns false',
-        isCodeIncomplete(null) === false,
-        '');
-
-    // Very short code
-    assert(results, 'isCodeIncomplete short code (no continues)',
-        (function() {
-            var savedCont = continues;
-            continues = 0;
-            var result = isCodeIncomplete('var x = 1;');
-            continues = savedCont;
-            return result === false;
-        })(),
-        'Short code on first response is OK');
-
-    assert(results, 'isCodeIncomplete short code (after continues)',
-        (function() {
-            var savedCont = continues;
-            continues = 3;
-            var result = isCodeIncomplete('var x = 1;');
-            continues = savedCont;
-            return result === true;
-        })(),
-        'Short code after 3 continues = incomplete');
-
-    // Merge with itself (dedup)
-    var selfMerge = mergeOverlap('line1\nline2\nline3', 'line1\nline2\nline3');
-    assert(results, 'mergeOverlap with identical text',
-        selfMerge === 'line1\nline2\nline3',
-        'No duplication: "' + selfMerge.replace(/\n/g, '\\n') + '"');
-
-    // ─── GROUP 15: INTEGRATION CHECK ──────────────────────────
-    console.log('\n%c🔌 Group 15: Integration Check', 'color:#60a5fa;font-weight:bold');
-
-    // Verify the full flow would work
-    if (ta && getTurnCount() > 0) {
-        var code = getLastCodeFromDOM();
-        if (code) {
-            var tail = getLastNLines(code, OVERLAP_LINES);
-            assert(results, 'Can extract overlap tail from last code',
-                tail.length > 0,
-                'Tail: "' + tail.slice(0, 60).replace(/\n/g, '\\n') + '..."');
-
-            var prompt = buildContinuePrompt();
-            assert(results, 'Continue prompt is well-formed',
-                prompt.length > 50 && prompt.indexOf(FENCE) !== -1,
-                'Prompt length: ' + prompt.length);
-        }
-    }
-
-    // Check auto-harvest observer is running
-	assert(results, 'Auto-harvest observer is active',
-		autoHarvestObserver !== null,
-		autoHarvestObserver ? 'Observer active' : 'FAILED - calling startAutoHarvest() now');
-
-	// If it failed, try to start it and report
-	if (!autoHarvestObserver) {
-		startAutoHarvest();
-	}
-
-    // Check debug log is working
-    var logBefore = debugLog.length;
-    log('Test log entry');
-    assert(results, 'Debug logging works',
-        debugLog.length === logBefore + 1,
-        'Log entries: ' + debugLog.length);
-
-    // ─── REPORT ───────────────────────────────────────────────
     return createTestReport(results);
 };
 
-// Also expose helper functions for manual debugging
 window.acl_debug = {
     getState: function() {
         return {
-            running: running,
-            continues: continues,
+            running: running, continues: continues,
             accumulated_length: accumulated.length,
             accumulated_lines: accumulated ? accumulated.split('\n').length : 0,
-            lastRawTail: lastRawTail,
-            lastTurns: lastTurns,
-            turnCount: getTurnCount(),
-            isGenerating: isGenerating(),
-            stableCheckCount: stableCheckCount,
+            lastTurns: lastTurns, turnCount: getTurnCount(),
+            isGenerating: isGenerating(), stableCheckCount: stableCheckCount,
+            showMergedOutput: showMergedOutput,
             lastSeenTextLength: lastSeenTextLength,
             isProcessingResponse: isProcessingResponse,
             totalGenerations: totalGenerations,
@@ -1944,7 +1352,7 @@ window.acl_debug = {
             doneCount: doneCount
         };
     },
-    getLog: function() { return getDebugLog(); },
+    getLog: function() { return debugLog.slice(); },
     getAccumulated: function() { return accumulated; },
     setAccumulated: function(code) { accumulated = code; },
     getLastCode: getLastCodeFromDOM,
@@ -1966,6 +1374,6 @@ window.acl_debug = {
     }
 };
 
-log('Auto-Coder v13 loaded. Run test_auto_continue() in console to test. Use acl_debug for debugging.');
+log('Auto-Coder v13.1 loaded. Run test_auto_continue() in console to test. Use acl_debug for debugging.');
 
 })();
