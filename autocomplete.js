@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Auto-Coder v13
+// @name         Auto-Coder v14
 // @namespace    http://tampermonkey.net/
-// @version      13.1
-// @description  Auto-continue with robust completion detection, overlap merging, harvest. FIXED: Continue prompt warns about backticks. FIXED: Merged output only shows at end.
+// @version      14.0
+// @description  Auto-continue with robust completion detection, overlap merging, harvest. FIXED: Dynamic bar height adjusts page. FIXED: Mid-run instructions. FIXED: Harvest reliability.
 // @match        https://you.com/*
 // @grant        none
 // ==/UserScript==
@@ -12,7 +12,7 @@
 
 var BT = String.fromCharCode(96);
 var FENCE = BT + BT + BT;
-var FINISH_MARKER = 'AUTOCODER_FINISHED';
+
 var DELAY_MS = 25000;
 var MAX = 25;
 var POLL_MS = 1500;
@@ -50,6 +50,9 @@ var isProcessingResponse = false;
 var debugLog = [];
 var showMergedOutput = false;
 var OVERLAP_LINES = 8;
+
+// NEW: Mid-run instruction queue
+var midRunInstructions = [];
 
 function log(msg) {
     var entry = '[AutoCoder ' + new Date().toISOString().slice(11,19) + '] ' + msg;
@@ -145,6 +148,14 @@ function getCodeBlocksFromElement(el) {
             if (pt.trim().length > 10) results.push(pt);
         }
     }
+    // NEW: Also try to find code in generic code-like containers
+    if (results.length === 0) {
+        var codeContainers = el.querySelectorAll('[class*="code"], [class*="Code"], [class*="highlight"]');
+        for (var m = 0; m < codeContainers.length; m++) {
+            var ct = codeContainers[m].textContent || '';
+            if (ct.trim().length > 10) results.push(ct);
+        }
+    }
     return results;
 }
 
@@ -187,7 +198,8 @@ function getTextarea() {
     return qs('#search-input-textarea') ||
            qs('textarea[data-testid="search-input-textarea"]') ||
            qs('textarea[placeholder*="Ask"]') ||
-           qs('textarea[placeholder*="ask"]');
+           qs('textarea[placeholder*="ask"]') ||
+           qs('textarea[placeholder*="How can"]');
 }
 
 function setNativeValue(ta, text) {
@@ -426,14 +438,6 @@ function isResponseFullySettled() {
     return true;
 }
 
-
-
-
-
-
-
-
-
 function getRawTail() {
     var code = getLastCodeFromDOM();
     var source = (code && code.trim().length > 0) ? code : accumulated;
@@ -443,12 +447,7 @@ function getRawTail() {
 
 function cleanMarkers(code) {
     var patterns = [
-        /^.*!!!!!CODEBLOCK_STARTS!!!!!.*$/gm,
-        /^.*!!!!!CODEBLOCK_ENDS!!!!!.*$/gm,
-        /^.*AUTOCODER_FINISHED.*$/gm,
-        /^.*>>>CODE STARTS<<<.*$/gm,
-        /^.*>>>CODE ENDS<<<.*$/gm,
-        /^.*>>>FINISHED<<<.*$/gm
+
     ];
     var cleaned = code;
     for (var i = 0; i < patterns.length; i++) {
@@ -474,7 +473,44 @@ function harvestAllCode() {
             }
         }
     }
+    // NEW: If DOM harvest failed but we have accumulated code, use that
+    if ((!allCode || allCode.trim().length < 50) && accumulated && accumulated.trim().length > 50) {
+        log('Harvest: DOM harvest insufficient, using accumulated code');
+        allCode = accumulated;
+    }
+    // NEW: Also try raw text extraction as last resort
+    if (!allCode || allCode.trim().length < 50) {
+        allCode = harvestFromRawText(turns);
+    }
     return allCode.trim();
+}
+
+// NEW: Fallback harvest that extracts code from raw text content
+function harvestFromRawText(turns) {
+    var allText = '';
+    for (var i = 0; i < turns.length; i++) {
+        var text = turns[i].innerText || turns[i].textContent || '';
+        allText += text + '\n';
+    }
+    // Try to find code between fence markers in the raw text
+    var codeBlocks = [];
+    var fenceRegex = new RegExp(FENCE + '[^\\n]*\\n([\\s\\S]*?)' + FENCE, 'g');
+    var match;
+    while ((match = fenceRegex.exec(allText)) !== null) {
+        if (match[1] && match[1].trim().length > 20) {
+            codeBlocks.push(match[1]);
+        }
+    }
+    if (codeBlocks.length === 0) return '';
+    var result = '';
+    for (var k = 0; k < codeBlocks.length; k++) {
+        var cleaned = cleanMarkers(codeBlocks[k]);
+        if (cleaned.trim().length > 20) {
+            result = mergeOverlap(result, cleaned);
+        }
+    }
+    log('Harvest: extracted ' + codeBlocks.length + ' blocks from raw text');
+    return result;
 }
 
 function isValidHarvest(code) {
@@ -492,8 +528,17 @@ function doHarvest() {
         } else {
             var turnCount = getTurnCount();
             var codeElCount = qsa('pre code', getChatRoot()).length;
-            setStatus('\u26A0 No valid code found. Turns: ' + turnCount + ', Code elements: ' + codeElCount);
-            log('Harvest failed. Turns: ' + turnCount + ', Code els: ' + codeElCount);
+            var preCount = qsa('pre', getChatRoot()).length;
+            var figureCount = qsa('figure[aria-label="Code Block"]', getChatRoot()).length;
+            setStatus('\u26A0 No valid code found. Turns: ' + turnCount + ', pre: ' + preCount + ', code: ' + codeElCount + ', figures: ' + figureCount);
+            log('Harvest failed. Turns: ' + turnCount + ', pre: ' + preCount + ', code els: ' + codeElCount + ', figures: ' + figureCount);
+            // NEW: Show diagnostic info
+            log('Harvest diagnostic: accumulated length = ' + accumulated.length);
+            var lastEl = getLastAnswerTurnEl();
+            if (lastEl) {
+                log('Harvest diagnostic: last turn text length = ' + (lastEl.textContent || '').length);
+                log('Harvest diagnostic: last turn innerHTML snippet = ' + (lastEl.innerHTML || '').substring(0, 200));
+            }
             return;
         }
     }
@@ -690,7 +735,7 @@ function poll() {
     }
 
     lastTurns = t;
-  
+
     if (responseHandleTimeout) clearTimeout(responseHandleTimeout);
     responseHandleTimeout = setTimeout(function() {
         handleResponseSafe();
@@ -756,7 +801,6 @@ function handleResponse() {
     }
 
     lastRawTail = getRawTail();
-    // FIX: Do NOT call injectCodeBlock here - only show at finish/harvest
     decideNextAction(text);
 }
 
@@ -831,7 +875,18 @@ function doSubmitContinue() {
     isProcessingResponse = false;
 
     setStatus('\u23F3 Continuing (' + continues + '/' + MAX + ')...');
-    submit(buildContinuePrompt());
+
+    // NEW: Check for mid-run instructions
+    var prompt = buildContinuePrompt();
+    if (midRunInstructions.length > 0) {
+        var instructions = midRunInstructions.join('\n');
+        midRunInstructions = [];
+        prompt = prompt + '\n\n=== ADDITIONAL INSTRUCTIONS ===\n' + instructions + '\n===============================';
+        log('Appended mid-run instructions to continue prompt');
+        setStatus('\u23F3 Continuing with new instructions (' + continues + '/' + MAX + ')...');
+    }
+
+    submit(prompt);
     pollTimeout = setTimeout(poll, CONTINUE_POLL_DELAY);
 }
 
@@ -866,10 +921,7 @@ function updateWaitUI() {
 
 // ============================================================
 // PROMPT BUILDING
-// FIX: Continue prompt warns AI not to start with triple backticks
 // ============================================================
-
-
 
 function findExactOverlap(aLines, bLines) {
     var maxCheck = Math.min(aLines.length, bLines.length, 30);
@@ -885,8 +937,6 @@ function findExactOverlap(aLines, bLines) {
 }
 
 function findPartialOverlap(aLines, bLines) {
-    // Look for a sequence of lines in B that matches a sequence at the END of A
-    // Key insight: the overlap might start BEFORE a truncated last line in A
     for (var startB = 0; startB < Math.min(10, bLines.length); startB++) {
         if (bLines[startB].trim() === '') continue;
         for (var posA = Math.max(0, aLines.length - 50); posA < aLines.length; posA++) {
@@ -896,21 +946,15 @@ function findPartialOverlap(aLines, bLines) {
                    aLines[posA + matchLen].trim() === bLines[startB + matchLen].trim()) {
                 matchLen++;
             }
-            // Case 1: match reaches the end of A exactly
             if (posA + matchLen >= aLines.length && matchLen >= 2) {
                 return { posA: posA, startB: startB, matchLen: matchLen, truncatedTail: false };
             }
-            // Case 2: match reaches aLines.length - 1 (all but last line matched)
-            // AND the last line of A looks truncated (it's a partial line that doesn't match)
-            // This handles the case where the last line of A is a cut-off version of a line in B
             if (posA + matchLen === aLines.length - 1 && matchLen >= 2) {
                 var lastA = aLines[aLines.length - 1].trim();
                 var correspondingB = (startB + matchLen < bLines.length) ? bLines[startB + matchLen].trim() : '';
-                // Check if lastA is a prefix/truncation of the corresponding B line
                 if (lastA.length > 0 && correspondingB.length > lastA.length && correspondingB.indexOf(lastA) === 0) {
                     return { posA: posA, startB: startB, matchLen: matchLen + 1, truncatedTail: true };
                 }
-                // Also check if lastA is just a truncated line (unmatched quotes, unclosed parens, etc.)
                 if (lastA.length > 0 && isLineTruncated(lastA)) {
                     return { posA: posA, startB: startB, matchLen: matchLen + 1, truncatedTail: true };
                 }
@@ -921,30 +965,19 @@ function findPartialOverlap(aLines, bLines) {
 }
 
 function isLineTruncated(line) {
-    // Check if a line appears to be cut off mid-way
     var trimmed = line.trim();
     if (trimmed.length === 0) return false;
-    // Unbalanced quotes
     var singleQuotes = countChar(trimmed, "'");
     var doubleQuotes = countChar(trimmed, '"');
     if (singleQuotes % 2 !== 0) return true;
     if (doubleQuotes % 2 !== 0) return true;
-    // Unbalanced parentheses
     var openParens = countChar(trimmed, '(');
     var closeParens = countChar(trimmed, ')');
     if (openParens > closeParens) return true;
-    // Unbalanced brackets
     var openBrackets = countChar(trimmed, '[');
     var closeBrackets = countChar(trimmed, ']');
     if (openBrackets > closeBrackets) return true;
-    // Ends with operators or incomplete tokens
     if (/[+\-*\/=,({|&:\\]$/.test(trimmed)) return true;
-    // Ends mid-word (no terminator)
-    if (/[a-zA-Z]$/.test(trimmed) && !/;$/.test(trimmed) && !/\*\/$/.test(trimmed)) {
-        // Could be truncated mid-word, but this is less certain
-        // Only flag if it also has unbalanced quotes or parens above
-        return false;
-    }
     return false;
 }
 
@@ -956,7 +989,6 @@ function fixTruncatedTail(aLines, bLines) {
     while (firstBIdx < bLines.length && bLines[firstBIdx].trim() === '') firstBIdx++;
     if (firstBIdx >= bLines.length) return false;
     var firstB = bLines[firstBIdx].trim();
-    // Case: first line of B is the complete version of the truncated last line of A
     if (firstB.length > lastA.length && firstB.indexOf(lastA) === 0) {
         aLines.pop();
         return true;
@@ -973,29 +1005,14 @@ function fixTruncatedTail(aLines, bLines) {
 }
 
 function findOverlapWithTruncation(aLines, bLines) {
-    // This is the KEY new function that handles the specific failure case:
-    // A ends with a truncated line, and B starts with context that overlaps
-    // lines BEFORE the truncated line in A.
-    //
-    // Example:
-    // A: [..., "ctx.fillStyle = '#ce93d8';", "ctx.font = '14px Segoe UI';", ... , "ctx.fillText('In set theory, {true, false} != {0, 1} even though they are"]
-    // B: ["ctx.fillStyle = '#ce93d8';", "ctx.font = '14px Segoe UI';", ..., "ctx.fillText('In set theory, {true, false} != {0, 1} even though they are isomorphic', width / 2, height - 35);", ...]
-    //
-    // We need to find where B's lines match a sequence in A (possibly ending before A's last line),
-    // and if A's last line is a truncated prefix of the next line in B after the matched region.
-
     var lastA = aLines[aLines.length - 1].trim();
     var lastAIsTruncated = isLineTruncated(lastA);
-
     if (!lastAIsTruncated) return null;
 
-    // Try to find where B's opening lines match a sequence in A that ends just before the truncated last line
     for (var startB = 0; startB < Math.min(10, bLines.length); startB++) {
         if (bLines[startB].trim() === '') continue;
-        // Search backwards from the second-to-last line of A
         for (var posA = Math.max(0, aLines.length - 50); posA < aLines.length - 1; posA++) {
             if (aLines[posA].trim() !== bLines[startB].trim()) continue;
-            // Count how many consecutive lines match
             var matchLen = 1;
             var bIdx = startB + 1;
             var aIdx = posA + 1;
@@ -1005,24 +1022,16 @@ function findOverlapWithTruncation(aLines, bLines) {
                 aIdx++;
                 bIdx++;
             }
-            // Now aIdx should be at aLines.length - 1 (the truncated line)
-            // Check if the truncated last line of A is a prefix of bLines[bIdx]
             if (aIdx === aLines.length - 1 && matchLen >= 2) {
                 if (bIdx < bLines.length) {
                     var bLineAtTrunc = bLines[bIdx].trim();
                     if (bLineAtTrunc.indexOf(lastA) === 0 || lastA.length === 0) {
-                        // Perfect: the truncated line is a prefix of the B line
-                        // Return: keep A up to posA (exclusive), take B from startB onward
                         return { posA: posA, startB: startB };
                     }
-                    // Even if it's not a perfect prefix match, if the last line is clearly truncated
-                    // and we have a good match sequence, trust the overlap
                     if (matchLen >= 3) {
                         return { posA: posA, startB: startB };
                     }
                 }
-                // If bIdx >= bLines.length, the entire B is within A (minus truncated tail)
-                // This shouldn't normally happen but handle it
                 if (bIdx >= bLines.length && matchLen >= 2) {
                     return { posA: posA, startB: startB };
                 }
@@ -1062,8 +1071,6 @@ function mergeOverlap(existing, fragment) {
     var aLines = existing.split('\n');
     var bLines = fragment.split('\n');
 
-    // Step 0: Try the truncation-aware overlap detection FIRST
-    // This handles the critical case where A ends mid-line and B repeats context before continuing
     var truncOverlap = findOverlapWithTruncation(aLines, bLines);
     if (truncOverlap) {
         log('Merge: truncation-aware overlap at posA=' + truncOverlap.posA + ' startB=' + truncOverlap.startB);
@@ -1073,10 +1080,8 @@ function mergeOverlap(existing, fragment) {
         return head.join('\n') + '\n' + tail.join('\n');
     }
 
-    // Step 1: Try fixTruncatedTail (simple case: first line of B completes last line of A)
     fixTruncatedTail(aLines, bLines);
 
-    // Step 2: Try exact overlap (last N lines of A match first N lines of B)
     var exact = findExactOverlap(aLines, bLines);
     if (exact > 0) {
         log('Merge: exact overlap of ' + exact + ' lines');
@@ -1085,7 +1090,6 @@ function mergeOverlap(existing, fragment) {
         return aLines.join('\n') + '\n' + remainder.join('\n');
     }
 
-    // Step 3: Try partial overlap (a sequence in B matches a sequence at end of A)
     var partial = findPartialOverlap(aLines, bLines);
     if (partial) {
         log('Merge: partial overlap at posA=' + partial.posA + ' startB=' + partial.startB + ' truncated=' + partial.truncatedTail);
@@ -1095,7 +1099,6 @@ function mergeOverlap(existing, fragment) {
         return headP.join('\n') + '\n' + tailP.join('\n');
     }
 
-    // Step 4: Mid-line split (last line of A + first line of B form one complete line)
     if (detectMidLineSplit(aLines, bLines)) {
         var firstBIdx = 0;
         while (firstBIdx < bLines.length && bLines[firstBIdx].trim() === '') firstBIdx++;
@@ -1110,7 +1113,6 @@ function mergeOverlap(existing, fragment) {
         return result;
     }
 
-    // Step 5: No overlap found, just concatenate
     log('Merge: no overlap found, concatenating');
     return aLines.join('\n') + '\n' + bLines.join('\n');
 }
@@ -1124,10 +1126,10 @@ function buildContinuePrompt() {
         noFenceWarning,
         '',
         'CRITICAL: Start by repeating at least the last 3 lines shown above, then continue with new code after them. This overlap is required for proper merging.',
-        'When you are 100% completely done with the ENTIRE file, write AUTOCODER_FINISHED after your code block on its own line.',
+
         '',
         'If you are NOT done yet, just stop mid-code. I will ask you to continue.',
-        'Do NOT write AUTOCODER_FINISHED unless the code is truly 100% complete.',
+
         "Make sure you start code blocks with 3 backticks again, so it works. And make also sure you do not write backticks inside of them to not leave the code."
     ].join('\n');
 }
@@ -1138,9 +1140,9 @@ function buildInitialPrompt(userText) {
         '=== RULES ===',
         'Write the complete code in a single code block.',
         'If you run out of space, just stop mid-code. I will ask you to continue.',
-        'When you are 100% completely finished with the ENTIRE file, write AUTOCODER_FINISHED after your code block on its own line.',
+
         '',
-        'Do NOT write AUTOCODER_FINISHED unless the code is truly 100% complete.',
+
         "Make sure you start code blocks with 3 backticks again, so it works. And make also sure you do not write backticks inside of them to not leave the code.",
         '============='
     ].join('\n');
@@ -1156,6 +1158,7 @@ function finish() {
     if (responseHandleTimeout) { clearTimeout(responseHandleTimeout); responseHandleTimeout = null; }
     if (pollTimeout) { clearTimeout(pollTimeout); pollTimeout = null; }
     isProcessingResponse = false;
+    midRunInstructions = []; // Clear any pending mid-run instructions
     markDone();
     updateBtn();
     var code = accumulated.trim();
@@ -1165,7 +1168,6 @@ function finish() {
         accumulated = code;
     }
 
-    // FIX: Only show merged output at the very end
     showMergedOutput = true;
     if (isValidHarvest(code)) {
         injectCodeBlock(code);
@@ -1185,7 +1187,8 @@ function start(prompt) {
     lastRawTail = '';
     prevHadUnclosedBlock = false;
     lastHarvestedText = '';
-    showMergedOutput = false; // FIX: Reset - don't show until finish
+    showMergedOutput = false;
+    midRunInstructions = []; // Clear mid-run instructions on fresh start
     lastTurns = getTurnCount();
     lastSeenTextLength = 0;
     stableCheckCount = 0;
@@ -1194,7 +1197,6 @@ function start(prompt) {
     if (responseHandleTimeout) { clearTimeout(responseHandleTimeout); responseHandleTimeout = null; }
     if (pollTimeout) { clearTimeout(pollTimeout); pollTimeout = null; }
 
-    // Remove old injected block if any
     var oldBlock = document.getElementById('acl-injected-block');
     if (oldBlock) oldBlock.remove();
 
@@ -1241,6 +1243,25 @@ function toggle() {
     start(text);
 }
 
+// NEW: Handle mid-run input submission
+function handleMidRunInput() {
+    var input = qs('#acl-input');
+    var text = input.value.trim();
+    if (!text) return;
+    if (!running) {
+        // Not running, start normally
+        input.value = '';
+        start(text);
+        return;
+    }
+    // Running: save instruction for next continue
+    midRunInstructions.push(text);
+    input.value = '';
+    setStatus('\uD83D\uDCDD Instruction queued (' + midRunInstructions.length + ' pending): "' + text.substring(0, 40) + (text.length > 40 ? '...' : '') + '"');
+    log('Mid-run instruction queued: ' + text.substring(0, 80));
+    playTone(660, 0, 0.1); // Short confirmation beep
+}
+
 // ============================================================
 // UI INITIALIZATION
 // ============================================================
@@ -1259,6 +1280,7 @@ function buildStyles() {
         '#acl-bar{position:fixed;bottom:0;left:0;right:0;z-index:9999999;display:flex;align-items:flex-end;background:linear-gradient(180deg,#0d0820,#0a0814);border-top:1px solid rgba(139,92,246,.4);padding:8px 12px;gap:10px;font:13px "SF Mono",monospace;box-shadow:0 -4px 30px rgba(124,58,237,.15);flex-wrap:wrap;}',
         '#acl-input{flex:1;min-width:200px;background:linear-gradient(135deg,#1a1528,#150f25);color:#e2e8f0;border:1px solid rgba(139,92,246,.3);border-radius:10px;padding:12px 16px;font:inherit;resize:vertical;min-height:40px;max-height:300px;transition:border-color .2s,box-shadow .2s;box-sizing:border-box;overflow-y:auto;line-height:1.4;}',
         '#acl-input:focus{outline:none;border-color:#7c3aed;box-shadow:0 0 0 3px rgba(124,58,237,.2);}',
+        '#acl-input.has-queued{border-color:#f59e0b;box-shadow:0 0 0 3px rgba(245,158,11,.2);}',
         '#acl-btn{width:44px;height:40px;border:none;border-radius:10px;cursor:pointer;background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;font-size:18px;transition:all .15s;box-shadow:0 4px 15px rgba(124,58,237,.4);flex-shrink:0;}',
         '#acl-btn:hover{transform:scale(1.05);box-shadow:0 6px 20px rgba(124,58,237,.5);}',
         '#acl-btn.acl-on{background:linear-gradient(135deg,#dc2626,#b91c1c);box-shadow:0 4px 15px rgba(220,38,38,.4);animation:acl-p 1.5s infinite}',
@@ -1286,13 +1308,14 @@ function buildStyles() {
         '#acl-panel-bar{display:flex;gap:10px;padding:14px;border-top:1px solid rgba(139,92,246,.2);background:rgba(0,0,0,.3);flex-wrap:wrap;}',
         '#acl-panel-bar button{padding:10px 20px;border:none;border-radius:10px;cursor:pointer;font:600 12px/1 sans-serif;transition:all .15s;}',
         '#acl-panel-bar button:hover{transform:scale(1.03);}',
+        '#acl-input.has-queued{border-color:#f59e0b;box-shadow:0 0 0 3px rgba(245,158,11,.2);}',
         'body{padding-bottom:' + (barHeight + 10) + 'px !important;transition:padding-bottom .2s;}'
     ].join('\n');
 }
 
 function buildBarHTML() {
     return [
-        '<textarea id="acl-input" placeholder="\u2728 Enter prompt... (Enter to start, Shift+Enter for newline)" rows="1"></textarea>',
+        '<textarea id="acl-input" placeholder="\u2728 Enter prompt... (Enter to start/queue instruction, Shift+Enter for newline)" rows="1"></textarea>',
         '<button id="acl-btn">\u25B6</button>',
         '<button id="acl-harvest">\uD83C\uDF3E Harvest</button>',
         '<span id="acl-status">\u2728 Ready</span>',
@@ -1315,10 +1338,28 @@ function buildPanelHTML() {
     return '<pre></pre><div id="acl-panel-bar"><button id="acl-copy" style="background:linear-gradient(135deg,#2563eb,#1d4ed8);color:#fff">Copy</button><button id="acl-dl" style="background:linear-gradient(135deg,#d97706,#b45309);color:#fff">Download</button><button id="acl-close" style="background:linear-gradient(135deg,#374151,#1f2937);color:#fff">Close</button></div>';
 }
 
+function updateInputVisual() {
+    var input = qs('#acl-input');
+    if (!input) return;
+    if (midRunInstructions.length > 0) {
+        input.classList.add('has-queued');
+        input.placeholder = '\uD83D\uDCDD ' + midRunInstructions.length + ' instruction(s) queued. Type more or wait...';
+    } else if (running) {
+        input.classList.remove('has-queued');
+        input.placeholder = '\uD83D\uDCDD Running... type here + Enter to queue instructions for next continue';
+    } else {
+        input.classList.remove('has-queued');
+        input.placeholder = '\u2728 Enter prompt... (Enter to start, Shift+Enter for newline)';
+    }
+}
+
 function attachEventListeners() {
     var input = qs('#acl-input');
     input.addEventListener('keydown', function(e) {
-        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); toggle(); }
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            handleMidRunInput();
+        }
     });
     input.addEventListener('input', function() {
         this.style.height = 'auto';
@@ -1326,7 +1367,14 @@ function attachEventListeners() {
         this.style.height = newH + 'px';
         updateBodyPadding();
     });
-    qs('#acl-btn').addEventListener('click', toggle);
+    qs('#acl-btn').addEventListener('click', function() {
+        if (running) return stop();
+        var input = qs('#acl-input');
+        var text = input.value.trim();
+        if (!text) return;
+        input.value = '';
+        start(text);
+    });
     qs('#acl-harvest').addEventListener('click', doHarvest);
     qs('#acl-skip').addEventListener('click', doSkip);
     qs('#acl-close').addEventListener('click', function() {
@@ -1339,6 +1387,7 @@ function attachEventListeners() {
         downloadFile(accumulated.trim(), 'output.html', 'text/html');
     });
 
+    // ResizeObserver for dynamic body padding
     if (window.ResizeObserver) {
         var ro = new ResizeObserver(function() { updateBodyPadding(); });
         ro.observe(qs('#acl-bar'));
@@ -1406,9 +1455,11 @@ if (!document.body) {
     bodyObserver.observe(document.documentElement, { childList: true });
 }
 
+// Periodic check: re-init UI if removed, update body padding, update input visual
 setInterval(function() {
     if (!qs('#acl-bar') && document.body) initUI();
     updateBodyPadding();
+    updateInputVisual();
 }, 3000);
 
 setInterval(function() {
@@ -1427,7 +1478,7 @@ function createTestReport(results) {
         else { failed++; errors.push(results[i]); }
     }
     console.log('\n%c' + Array(44).join('='), 'color:#7c3aed;font-weight:bold');
-    console.log('%c  AUTO-CODER v13.1 TEST RESULTS', 'color:#c4b5fd;font-weight:bold;font-size:14px');
+    console.log('%c  AUTO-CODER v14 TEST RESULTS', 'color:#c4b5fd;font-weight:bold;font-size:14px');
     console.log('%c' + Array(44).join('='), 'color:#7c3aed;font-weight:bold');
     console.log('%c  Passed: ' + passed, 'color:#34d399;font-weight:bold');
     console.log('%c  Failed: ' + failed, 'color:#f87171;font-weight:bold');
@@ -1450,7 +1501,7 @@ function assert(results, name, condition, msg) {
 
 window.test_auto_continue = function() {
     var results = [];
-    console.log('\n%cRunning Auto-Coder v13.1 Test Suite...', 'color:#a855f7;font-weight:bold;font-size:13px');
+    console.log('\n%cRunning Auto-Coder v14 Test Suite...', 'color:#a855f7;font-weight:bold;font-size:13px');
 
     var chatRoot = getChatRoot();
     assert(results, 'getChatRoot finds element', chatRoot !== null, chatRoot ? (chatRoot.id || chatRoot.tagName) : 'null');
@@ -1478,7 +1529,6 @@ window.test_auto_continue = function() {
 
     assert(results, 'isCodeIncomplete unclosed HTML', isCodeIncomplete('<!DOCTYPE html><html><body>') === true, '');
     assert(results, 'isCodeIncomplete closed HTML', isCodeIncomplete('<!DOCTYPE html><html></html>') === false, '');
-    assert(results, 'isCodeIncomplete with FINISH_MARKER', isCodeIncomplete('code\nAUTOCODER_FINISHED') === false, '');
 
     var initPrompt = buildInitialPrompt('test prompt');
     assert(results, 'buildInitialPrompt has user text', initPrompt.indexOf('test prompt') !== -1, '');
@@ -1495,6 +1545,12 @@ window.test_auto_continue = function() {
     accumulated = savedAcc;
     lastRawTail = savedTail;
 
+    // NEW: Test mid-run instructions
+    midRunInstructions = [];
+    midRunInstructions.push('test instruction');
+    assert(results, 'midRunInstructions queue works', midRunInstructions.length === 1, 'Length: ' + midRunInstructions.length);
+    midRunInstructions = [];
+
     assert(results, 'showMergedOutput flag exists', typeof showMergedOutput === 'boolean', 'Value: ' + showMergedOutput);
 
     assert(results, 'UI bar exists', qs('#acl-bar') !== null, '');
@@ -1505,9 +1561,11 @@ window.test_auto_continue = function() {
     assert(results, 'UI wait exists', qs('#acl-wait') !== null, '');
 
     assert(results, 'cleanMarkers removes markers',
-        cleanMarkers('code\nAUTOCODER_FINISHED\nmore').indexOf('AUTOCODER_FINISHED') === -1, '');
 
     assert(results, 'countFences works', countFences(FENCE + 'js\ncode\n' + FENCE) === 2, '');
+
+    // NEW: Test harvestFromRawText exists
+    assert(results, 'harvestFromRawText function exists', typeof harvestFromRawText === 'function', '');
 
     return createTestReport(results);
 };
@@ -1525,7 +1583,8 @@ window.acl_debug = {
             isProcessingResponse: isProcessingResponse,
             totalGenerations: totalGenerations,
             processingCount: processingCount,
-            doneCount: doneCount
+            doneCount: doneCount,
+            midRunInstructions: midRunInstructions.slice()
         };
     },
     getLog: function() { return debugLog.slice(); },
@@ -1547,9 +1606,11 @@ window.acl_debug = {
     getCodeBlocks: function() {
         var el = getLastAnswerTurnEl();
         return el ? getCodeBlocksFromElement(el) : [];
-    }
+    },
+    getMidRunInstructions: function() { return midRunInstructions.slice(); },
+    clearMidRunInstructions: function() { midRunInstructions = []; updateInputVisual(); }
 };
 
-log('Auto-Coder v13.1 loaded. Run test_auto_continue() in console to test. Use acl_debug for debugging.');
+log('Auto-Coder v14 loaded. Run test_auto_continue() in console to test. Use acl_debug for debugging.');
 
 })();
