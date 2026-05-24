@@ -1560,8 +1560,6 @@ window.test_auto_continue = function() {
     assert(results, 'UI status exists', qs('#acl-status') !== null, '');
     assert(results, 'UI wait exists', qs('#acl-wait') !== null, '');
 
-    assert(results, 'cleanMarkers removes markers',
-
     assert(results, 'countFences works', countFences(FENCE + 'js\ncode\n' + FENCE) === 2, '');
 
     // NEW: Test harvestFromRawText exists
