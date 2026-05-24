@@ -183,16 +183,7 @@ function getAllCodeFromAllTurns() {
     return allBlocks;
 }
 
-function isDone(turnText) {
-    if (turnText.indexOf(FINISH_MARKER) !== -1) return true;
-    var el = getLastAnswerTurnEl();
-    if (!el) return false;
-    var textSpans = el.querySelectorAll('[data-testid="youchat-text"]');
-    for (var i = 0; i < textSpans.length; i++) {
-        if ((textSpans[i].textContent || '').indexOf(FINISH_MARKER) !== -1) return true;
-    }
-    return false;
-}
+
 
 function getTextarea() {
     return qs('#search-input-textarea') ||
@@ -369,8 +360,198 @@ function hasUnbalancedBraces(t) {
     return diff > 2;
 }
 
-function hasUnclosedScript(t) { return countMatches(t, /<script/gi) > countMatches(t, /<\/script>/gi); }
-function hasUnclosedStyle(t) { return countMatches(t, /<style/gi) > countMatches(t, /<\/style>/gi); }
+function isCodeIncomplete(code) {
+    if (!code || code.trim().length === 0) return false;
+    var trimmed = code.trim();
+
+    // If code ends with </html>, it's complete
+    if (endsWithHtmlClose(trimmed)) return false;
+
+    // If code ends with a self-executing function closure, it's complete
+    if (/\}\s*\)\s*\(\s*\)\s*;?\s*$/.test(trimmed.slice(-20))) return false;
+
+    // If code is very short and we've already continued at least once, it's likely truncated
+    if (trimmed.length < MIN_CODE_LENGTH_FOR_COMPLETE && continues > 0) return true;
+
+    // NEW: Check if code ends abruptly mid-statement (strong signal of truncation)
+    // This catches cases where the DOM closes the code block but content was cut off
+    var lines = trimmed.split('\n');
+    var lastNonEmpty = '';
+    for (var i = lines.length - 1; i >= 0; i--) {
+        if (lines[i].trim().length > 0) {
+            lastNonEmpty = lines[i].trim();
+            break;
+        }
+    }
+
+    // NEW: If the last line is a simple statement like "if (!x) return;" but we have
+    // unclosed structural elements, that's a strong truncation signal
+    // Check for unclosed <script> tag - this is the key fix for the reported bug
+    if (hasUnclosedScript(trimmed)) return true;
+    if (hasUnclosedStyle(trimmed)) return true;
+    if (hasUnclosedHtml(trimmed)) return true;
+
+    // NEW: If we have an open <script> or <style> and the code doesn't end with
+    // </script> or </style> followed by </body></html>, it's incomplete
+    if (/<script[\s>]/i.test(trimmed) && !/<\/script>\s*$/i.test(trimmed.slice(-50)) && !endsWithHtmlClose(trimmed)) {
+        // Has a script tag but doesn't end with closing script or closing html
+        if (hasUnbalancedBraces(trimmed)) return true;
+    }
+
+    return lastLineIsCutOff(trimmed) ||
+           hasUnbalancedBraces(trimmed) ||
+           hasUnclosedParens(trimmed) ||
+           hasUnclosedBrackets(trimmed) ||
+           endsAbruptlyMidBlock(trimmed) ||
+           hasUnclosedIIFE(trimmed) ||
+           hasUnclosedTemplateLiteral(trimmed);
+}
+
+function isResponseFullySettled() {
+    if (isGenerating()) return false;
+    var el = getLastAnswerTurnEl();
+    if (!el) return false;
+    if (isTextStillChanging()) return false;
+    if (stableCheckCount < STREAM_STABLE_CHECKS) return false;
+    var text = el.innerText || '';
+    if (countFences(text) % 2 !== 0) return false;
+
+    // NEW: Even if the DOM shows a "closed" code block, check if the content
+    // inside is structurally complete. The model may have hit its output limit
+    // causing the platform to close the DOM element prematurely.
+    var lastCode = getLastCodeFromDOM();
+    if (lastCode && lastCode.trim().length > MIN_CODE_LENGTH_FOR_COMPLETE) {
+        if (isCodeIncomplete(lastCode.trim())) {
+            // The code block is structurally incomplete even though DOM is closed
+            // This means the model hit its output limit
+            return true; // Still return true - it IS settled (stopped generating)
+            // but we'll handle the incompleteness in decideNextAction
+        }
+    }
+
+    return true;
+}
+
+function decideNextAction(text) {
+    if (isDone(text)) {
+        log('FINISHED marker detected - completing.');
+        finish();
+        return;
+    }
+
+    if (continues >= MAX) {
+        log('Max continues reached (' + MAX + ') - completing.');
+        finish();
+        return;
+    }
+
+    var accTrimmed = accumulated.trim();
+
+    if (accTrimmed.length > 0) {
+        if (isCodeIncomplete(accTrimmed)) {
+            log('Code incomplete (structural check on accumulated) - continuing. ' + accTrimmed.length + ' chars');
+            setStatus('\u26A0 Code incomplete (' + accTrimmed.split('\n').length + ' lines), auto-continuing...');
+            scheduleNext();
+            return;
+        }
+
+        // NEW: Also check the raw last code block from DOM independently
+        // This catches cases where mergeOverlap may have altered the structure
+        var lastCode = getLastCodeFromDOM();
+        if (lastCode && lastCode.trim().length > 0) {
+            var lastCodeTrimmed = lastCode.trim();
+            if (isCodeIncomplete(lastCodeTrimmed)) {
+                log('Last DOM code block incomplete - continuing. ' + lastCodeTrimmed.length + ' chars');
+                setStatus('\u26A0 Last code block incomplete, auto-continuing...');
+                scheduleNext();
+                return;
+            }
+
+            // NEW: Additional heuristic - if the last code block contains HTML structure
+            // markers (like <!DOCTYPE) but doesn't end with </html>, it's incomplete
+            // regardless of what other checks say
+            if (/<!DOCTYPE/i.test(lastCodeTrimmed) && !/<\/html>/i.test(lastCodeTrimmed)) {
+                log('Last DOM code has DOCTYPE but no closing </html> - continuing.');
+                setStatus('\u26A0 HTML document incomplete (no </html>), auto-continuing...');
+                scheduleNext();
+                return;
+            }
+
+            // NEW: If code has an unclosed <script> tag, it's definitely incomplete
+            if (countMatches(lastCodeTrimmed, /<script[\s>]/gi) > countMatches(lastCodeTrimmed, /<\/script>/gi)) {
+                log('Last DOM code has unclosed <script> tag - continuing.');
+                setStatus('\u26A0 Unclosed <script> detected, auto-continuing...');
+                scheduleNext();
+                return;
+            }
+
+            // NEW: If code has an unclosed <style> tag, it's definitely incomplete
+            if (countMatches(lastCodeTrimmed, /<style[\s>]/gi) > countMatches(lastCodeTrimmed, /<\/style>/gi)) {
+                log('Last DOM code has unclosed <style> tag - continuing.');
+                setStatus('\u26A0 Unclosed <style> detected, auto-continuing...');
+                scheduleNext();
+                return;
+            }
+        }
+
+        log('Code appears complete. ' + accTrimmed.split('\n').length + ' lines.');
+        finish();
+    } else {
+        // No accumulated code yet - try to get it from DOM
+        var domCode = getLastCodeFromDOM();
+        if (domCode && domCode.trim().length > 20) {
+            accumulated = cleanMarkers(domCode);
+            if (isCodeIncomplete(accumulated)) {
+                log('Found code in DOM, incomplete - continuing.');
+                scheduleNext();
+                return;
+            }
+
+            // NEW: Same additional checks as above for the no-accumulated path
+            var domTrimmed = accumulated.trim();
+            if (/<!DOCTYPE/i.test(domTrimmed) && !/<\/html>/i.test(domTrimmed)) {
+                log('DOM code has DOCTYPE but no closing </html> - continuing.');
+                setStatus('\u26A0 HTML document incomplete (no </html>), auto-continuing...');
+                scheduleNext();
+                return;
+            }
+            if (countMatches(domTrimmed, /<script[\s>]/gi) > countMatches(domTrimmed, /<\/script>/gi)) {
+                log('DOM code has unclosed <script> tag - continuing.');
+                setStatus('\u26A0 Unclosed <script> detected, auto-continuing...');
+                scheduleNext();
+                return;
+            }
+
+            finish();
+        } else {
+            setStatus('\u26A0 No code detected, stopping.');
+            finish();
+        }
+    }
+}
+
+function isDone(turnText) {
+    // NOTE: FINISH_MARKER is not defined in this script, so this function
+    // effectively only returns false. If you want a finish marker, define it:
+    // var FINISH_MARKER = '// END OF CODE';
+    if (typeof FINISH_MARKER !== 'undefined' && turnText.indexOf(FINISH_MARKER) !== -1) return true;
+    var el = getLastAnswerTurnEl();
+    if (!el) return false;
+    var textSpans = el.querySelectorAll('[data-testid="youchat-text"]');
+    for (var i = 0; i < textSpans.length; i++) {
+        var spanText = textSpans[i].textContent || '';
+        if (typeof FINISH_MARKER !== 'undefined' && spanText.indexOf(FINISH_MARKER) !== -1) return true;
+    }
+    return false;
+}
+
+function hasUnclosedScript(t) {
+    return countMatches(t, /<script[\s>]/gi) > countMatches(t, /<\/script>/gi);
+}
+
+function hasUnclosedStyle(t) {
+    return countMatches(t, /<style[\s>]/gi) > countMatches(t, /<\/style>/gi);
+}
 
 function hasUnclosedParens(t) {
     var diff = countMatches(t, /\(/g) - countMatches(t, /\)/g);
@@ -408,35 +589,9 @@ function endsAbruptlyMidBlock(trimmed) {
     return false;
 }
 
-function isCodeIncomplete(code) {
-    if (!code || code.trim().length === 0) return false;
-    var trimmed = code.trim();
-    if (trimmed.indexOf(FINISH_MARKER) !== -1) return false;
-    if (endsWithHtmlClose(trimmed)) return false;
-    if (/\}\s*\)\s*\(\s*\)\s*;?\s*$/.test(trimmed.slice(-20))) return false;
-    if (trimmed.length < MIN_CODE_LENGTH_FOR_COMPLETE && continues > 0) return true;
-    return lastLineIsCutOff(trimmed) ||
-           hasUnclosedHtml(trimmed) ||
-           hasUnbalancedBraces(trimmed) ||
-           hasUnclosedScript(trimmed) ||
-           hasUnclosedStyle(trimmed) ||
-           hasUnclosedParens(trimmed) ||
-           hasUnclosedBrackets(trimmed) ||
-           endsAbruptlyMidBlock(trimmed) ||
-           hasUnclosedIIFE(trimmed) ||
-           hasUnclosedTemplateLiteral(trimmed);
-}
 
-function isResponseFullySettled() {
-    if (isGenerating()) return false;
-    var el = getLastAnswerTurnEl();
-    if (!el) return false;
-    if (isTextStillChanging()) return false;
-    if (stableCheckCount < STREAM_STABLE_CHECKS) return false;
-    var text = el.innerText || '';
-    if (countFences(text) % 2 !== 0) return false;
-    return true;
-}
+
+
 
 function getRawTail() {
     var code = getLastCodeFromDOM();
@@ -804,55 +959,7 @@ function handleResponse() {
     decideNextAction(text);
 }
 
-function decideNextAction(text) {
-    if (isDone(text)) {
-        log('FINISHED marker detected - completing.');
-        finish();
-        return;
-    }
 
-    if (continues >= MAX) {
-        log('Max continues reached (' + MAX + ') - completing.');
-        finish();
-        return;
-    }
-
-    var accTrimmed = accumulated.trim();
-
-    if (accTrimmed.length > 0) {
-        if (isCodeIncomplete(accTrimmed)) {
-            log('Code incomplete (structural check) - continuing. ' + accTrimmed.length + ' chars');
-            setStatus('\u26A0 Code incomplete (' + accTrimmed.split('\n').length + ' lines), auto-continuing...');
-            scheduleNext();
-            return;
-        }
-
-        var lastCode = getLastCodeFromDOM();
-        if (lastCode && isCodeIncomplete(lastCode)) {
-            log('Last DOM code block incomplete - continuing.');
-            setStatus('\u26A0 Last code block incomplete, auto-continuing...');
-            scheduleNext();
-            return;
-        }
-
-        log('Code appears complete. ' + accTrimmed.split('\n').length + ' lines.');
-        finish();
-    } else {
-        var domCode = getLastCodeFromDOM();
-        if (domCode && domCode.trim().length > 20) {
-            accumulated = cleanMarkers(domCode);
-            if (isCodeIncomplete(accumulated)) {
-                log('Found code in DOM, incomplete - continuing.');
-                scheduleNext();
-                return;
-            }
-            finish();
-        } else {
-            setStatus('\u26A0 No code detected, stopping.');
-            finish();
-        }
-    }
-}
 
 // ============================================================
 // CONTINUE SCHEDULING
