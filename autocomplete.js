@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Auto-Coder v14
+// @name         Auto-Coder v15
 // @namespace    http://tampermonkey.net/
-// @version      14.0
-// @description  Auto-continue with robust completion detection, overlap merging, harvest. FIXED: Dynamic bar height adjusts page. FIXED: Mid-run instructions. FIXED: Harvest reliability.
+// @version      15.0
+// @description  Auto-continue with robust completion detection, IMPROVED overlap merging using Levenshtein distance matrix, harvest. FIXED: Dynamic bar height adjusts page. FIXED: Mid-run instructions. FIXED: Harvest reliability.
 // @match        https://you.com/*
 // @grant        none
 // ==/UserScript==
@@ -53,6 +53,13 @@ var OVERLAP_LINES = 8;
 
 // NEW: Mid-run instruction queue
 var midRunInstructions = [];
+
+// MERGE TUNING PARAMETERS
+var MERGE_SEARCH_WINDOW = 40; // How many lines from end of A to search
+var MERGE_CANDIDATE_WINDOW = 15; // How many lines from start of B to consider as overlap start
+var MERGE_LINE_SIMILARITY_THRESHOLD = 0.6; // Minimum similarity for a line to be considered "matching"
+var MERGE_MIN_CONSECUTIVE_MATCHES = 2; // Minimum consecutive similar lines to consider an overlap
+var MERGE_PREFER_NEWER = true; // When in doubt, prefer the newer (B) text
 
 function log(msg) {
     var entry = '[AutoCoder ' + new Date().toISOString().slice(11,19) + '] ' + msg;
@@ -148,7 +155,6 @@ function getCodeBlocksFromElement(el) {
             if (pt.trim().length > 10) results.push(pt);
         }
     }
-    // NEW: Also try to find code in generic code-like containers
     if (results.length === 0) {
         var codeContainers = el.querySelectorAll('[class*="code"], [class*="Code"], [class*="highlight"]');
         for (var m = 0; m < codeContainers.length; m++) {
@@ -182,8 +188,6 @@ function getAllCodeFromAllTurns() {
     }
     return allBlocks;
 }
-
-
 
 function getTextarea() {
     return qs('#search-input-textarea') ||
@@ -364,17 +368,10 @@ function isCodeIncomplete(code) {
     if (!code || code.trim().length === 0) return false;
     var trimmed = code.trim();
 
-    // If code ends with </html>, it's complete
     if (endsWithHtmlClose(trimmed)) return false;
-
-    // If code ends with a self-executing function closure, it's complete
     if (/\}\s*\)\s*\(\s*\)\s*;?\s*$/.test(trimmed.slice(-20))) return false;
-
-    // If code is very short and we've already continued at least once, it's likely truncated
     if (trimmed.length < MIN_CODE_LENGTH_FOR_COMPLETE && continues > 0) return true;
 
-    // NEW: Check if code ends abruptly mid-statement (strong signal of truncation)
-    // This catches cases where the DOM closes the code block but content was cut off
     var lines = trimmed.split('\n');
     var lastNonEmpty = '';
     for (var i = lines.length - 1; i >= 0; i--) {
@@ -384,17 +381,11 @@ function isCodeIncomplete(code) {
         }
     }
 
-    // NEW: If the last line is a simple statement like "if (!x) return;" but we have
-    // unclosed structural elements, that's a strong truncation signal
-    // Check for unclosed <script> tag - this is the key fix for the reported bug
     if (hasUnclosedScript(trimmed)) return true;
     if (hasUnclosedStyle(trimmed)) return true;
     if (hasUnclosedHtml(trimmed)) return true;
 
-    // NEW: If we have an open <script> or <style> and the code doesn't end with
-    // </script> or </style> followed by </body></html>, it's incomplete
     if (/<script[\s>]/i.test(trimmed) && !/<\/script>\s*$/i.test(trimmed.slice(-50)) && !endsWithHtmlClose(trimmed)) {
-        // Has a script tag but doesn't end with closing script or closing html
         if (hasUnbalancedBraces(trimmed)) return true;
     }
 
@@ -416,16 +407,10 @@ function isResponseFullySettled() {
     var text = el.innerText || '';
     if (countFences(text) % 2 !== 0) return false;
 
-    // NEW: Even if the DOM shows a "closed" code block, check if the content
-    // inside is structurally complete. The model may have hit its output limit
-    // causing the platform to close the DOM element prematurely.
     var lastCode = getLastCodeFromDOM();
     if (lastCode && lastCode.trim().length > MIN_CODE_LENGTH_FOR_COMPLETE) {
         if (isCodeIncomplete(lastCode.trim())) {
-            // The code block is structurally incomplete even though DOM is closed
-            // This means the model hit its output limit
-            return true; // Still return true - it IS settled (stopped generating)
-            // but we'll handle the incompleteness in decideNextAction
+            return true;
         }
     }
 
@@ -455,8 +440,6 @@ function decideNextAction(text) {
             return;
         }
 
-        // NEW: Also check the raw last code block from DOM independently
-        // This catches cases where mergeOverlap may have altered the structure
         var lastCode = getLastCodeFromDOM();
         if (lastCode && lastCode.trim().length > 0) {
             var lastCodeTrimmed = lastCode.trim();
@@ -467,9 +450,6 @@ function decideNextAction(text) {
                 return;
             }
 
-            // NEW: Additional heuristic - if the last code block contains HTML structure
-            // markers (like <!DOCTYPE) but doesn't end with </html>, it's incomplete
-            // regardless of what other checks say
             if (/<!DOCTYPE/i.test(lastCodeTrimmed) && !/<\/html>/i.test(lastCodeTrimmed)) {
                 log('Last DOM code has DOCTYPE but no closing </html> - continuing.');
                 setStatus('\u26A0 HTML document incomplete (no </html>), auto-continuing...');
@@ -477,7 +457,6 @@ function decideNextAction(text) {
                 return;
             }
 
-            // NEW: If code has an unclosed <script> tag, it's definitely incomplete
             if (countMatches(lastCodeTrimmed, /<script[\s>]/gi) > countMatches(lastCodeTrimmed, /<\/script>/gi)) {
                 log('Last DOM code has unclosed <script> tag - continuing.');
                 setStatus('\u26A0 Unclosed <script> detected, auto-continuing...');
@@ -485,7 +464,6 @@ function decideNextAction(text) {
                 return;
             }
 
-            // NEW: If code has an unclosed <style> tag, it's definitely incomplete
             if (countMatches(lastCodeTrimmed, /<style[\s>]/gi) > countMatches(lastCodeTrimmed, /<\/style>/gi)) {
                 log('Last DOM code has unclosed <style> tag - continuing.');
                 setStatus('\u26A0 Unclosed <style> detected, auto-continuing...');
@@ -497,7 +475,6 @@ function decideNextAction(text) {
         log('Code appears complete. ' + accTrimmed.split('\n').length + ' lines.');
         finish();
     } else {
-        // No accumulated code yet - try to get it from DOM
         var domCode = getLastCodeFromDOM();
         if (domCode && domCode.trim().length > 20) {
             accumulated = cleanMarkers(domCode);
@@ -507,7 +484,6 @@ function decideNextAction(text) {
                 return;
             }
 
-            // NEW: Same additional checks as above for the no-accumulated path
             var domTrimmed = accumulated.trim();
             if (/<!DOCTYPE/i.test(domTrimmed) && !/<\/html>/i.test(domTrimmed)) {
                 log('DOM code has DOCTYPE but no closing </html> - continuing.');
@@ -531,9 +507,6 @@ function decideNextAction(text) {
 }
 
 function isDone(turnText) {
-    // NOTE: FINISH_MARKER is not defined in this script, so this function
-    // effectively only returns false. If you want a finish marker, define it:
-    // var FINISH_MARKER = '// END OF CODE';
     if (typeof FINISH_MARKER !== 'undefined' && turnText.indexOf(FINISH_MARKER) !== -1) return true;
     var el = getLastAnswerTurnEl();
     if (!el) return false;
@@ -589,9 +562,272 @@ function endsAbruptlyMidBlock(trimmed) {
     return false;
 }
 
+// ============================================================
+// IMPROVED MERGE LOGIC: Levenshtein-based fuzzy line matching
+// ============================================================
 
+// Compute Levenshtein distance between two strings
+function levenshteinDistance(a, b) {
+    if (a === b) return 0;
+    if (a.length === 0) return b.length;
+    if (b.length === 0) return a.length;
 
+    // Optimization: if strings are very different in length, skip full computation
+    var lenDiff = Math.abs(a.length - b.length);
+    var maxLen = Math.max(a.length, b.length);
+    if (lenDiff > maxLen * 0.7) return maxLen;
 
+    // Use two-row optimization for memory efficiency
+    var prev = [];
+    var curr = [];
+    for (var j = 0; j <= b.length; j++) prev[j] = j;
+
+    for (var i = 1; i <= a.length; i++) {
+        curr[0] = i;
+        for (var jj = 1; jj <= b.length; jj++) {
+            var cost = a[i - 1] === b[jj - 1] ? 0 : 1;
+            curr[jj] = Math.min(
+                curr[jj - 1] + 1,      // insertion
+                prev[jj] + 1,           // deletion
+                prev[jj - 1] + cost     // substitution
+            );
+        }
+        var tmp = prev;
+        prev = curr;
+        curr = tmp;
+    }
+    return prev[b.length];
+}
+
+// Compute normalized similarity between two lines (0 = totally different, 1 = identical)
+function lineSimilarity(lineA, lineB) {
+    var a = lineA.trim();
+    var b = lineB.trim();
+
+    // Both empty = perfect match
+    if (a === '' && b === '') return 1.0;
+    // One empty, one not = no match
+    if (a === '' || b === '') return 0.0;
+    // Exact match
+    if (a === b) return 1.0;
+
+    var maxLen = Math.max(a.length, b.length);
+
+    // Quick check: if one is a prefix/suffix of the other (truncation case)
+    if (a.length >= 3 && b.indexOf(a) === 0) return a.length / b.length;
+    if (b.length >= 3 && a.indexOf(b) === 0) return b.length / a.length;
+
+    // For very long lines, compare chunks to avoid expensive full Levenshtein
+    if (maxLen > 500) {
+        // Compare first 200 and last 200 chars
+        var prefixSim = lineSimilarity(a.substring(0, 200), b.substring(0, 200));
+        var suffixSim = lineSimilarity(a.slice(-200), b.slice(-200));
+        return (prefixSim + suffixSim) / 2;
+    }
+
+    var dist = levenshteinDistance(a, b);
+    return 1.0 - (dist / maxLen);
+}
+
+// Build a similarity matrix between tail of A and head of B
+// Returns a 2D array where matrix[i][j] = similarity(aLines[aStart+i], bLines[j])
+function buildSimilarityMatrix(aLines, aStart, aEnd, bLines, bStart, bEnd) {
+    var rows = aEnd - aStart;
+    var cols = bEnd - bStart;
+    var matrix = [];
+    for (var i = 0; i < rows; i++) {
+        matrix[i] = [];
+        for (var j = 0; j < cols; j++) {
+            matrix[i][j] = lineSimilarity(aLines[aStart + i], bLines[bStart + j]);
+        }
+    }
+    return matrix;
+}
+
+// Find the best diagonal alignment in the similarity matrix
+// A diagonal represents a consistent overlap: aLines[aStart+i] matches bLines[bStart+i+offset]
+// Returns { aOffset, bOffset, length, avgSimilarity } or null
+function findBestDiagonalAlignment(matrix, rows, cols) {
+    var bestAlignment = null;
+    var bestScore = 0;
+
+    // Try all possible diagonal starting points
+    // Diagonal offset: for each possible start in A's tail matching some start in B's head
+    for (var startRow = 0; startRow < rows; startRow++) {
+        for (var startCol = 0; startCol < cols; startCol++) {
+            // Walk along this diagonal
+            var matchCount = 0;
+            var totalSim = 0;
+            var consecutiveGood = 0;
+            var maxConsecutive = 0;
+            var diagLen = Math.min(rows - startRow, cols - startCol);
+
+            for (var d = 0; d < diagLen; d++) {
+                var sim = matrix[startRow + d][startCol + d];
+                totalSim += sim;
+                if (sim >= MERGE_LINE_SIMILARITY_THRESHOLD) {
+                    matchCount++;
+                    consecutiveGood++;
+                    if (consecutiveGood > maxConsecutive) maxConsecutive = consecutiveGood;
+                } else {
+                    consecutiveGood = 0;
+                }
+            }
+
+            if (matchCount < MERGE_MIN_CONSECUTIVE_MATCHES) continue;
+            if (maxConsecutive < MERGE_MIN_CONSECUTIVE_MATCHES) continue;
+
+            // Score: prefer longer matches with higher similarity
+            // Also prefer alignments that reach the end of A (meaning B continues where A left off)
+            var avgSim = totalSim / diagLen;
+            var reachesEndOfA = (startRow + diagLen >= rows);
+            var score = matchCount * avgSim * (reachesEndOfA ? 2.0 : 1.0) * (maxConsecutive / diagLen + 0.5);
+
+            if (score > bestScore) {
+                bestScore = score;
+                bestAlignment = {
+                    aOffset: startRow,
+                    bOffset: startCol,
+                    length: diagLen,
+                    matchCount: matchCount,
+                    maxConsecutive: maxConsecutive,
+                    avgSimilarity: avgSim,
+                    score: score,
+                    reachesEndOfA: reachesEndOfA
+                };
+            }
+        }
+    }
+
+    return bestAlignment;
+}
+
+// Determine the exact merge point given an alignment
+// When lines differ slightly in the overlap region, prefer the newer (B) version
+function computeMergeResult(aLines, bLines, alignment, aSearchStart) {
+    var aOverlapStart = aSearchStart + alignment.aOffset;
+    var bOverlapStart = alignment.bOffset;
+    var overlapLen = alignment.length;
+
+    // Take everything from A before the overlap
+    var result = aLines.slice(0, aOverlapStart);
+
+    // For the overlap region, prefer the newer (B) text when lines differ
+    if (MERGE_PREFER_NEWER) {
+        // Use B's version of the overlapping lines
+        var bOverlapEnd = bOverlapStart + overlapLen;
+        // Then append everything from B starting at the overlap start
+        var bRemainder = bLines.slice(bOverlapStart);
+        for (var i = 0; i < bRemainder.length; i++) {
+            result.push(bRemainder[i]);
+        }
+    } else {
+        // Use A's version of the overlap, then append B after overlap
+        for (var j = aOverlapStart; j < aOverlapStart + overlapLen; j++) {
+            result.push(aLines[j]);
+        }
+        var bAfterOverlap = bLines.slice(bOverlapStart + overlapLen);
+        for (var k = 0; k < bAfterOverlap.length; k++) {
+            result.push(bAfterOverlap[k]);
+        }
+    }
+
+    return result.join('\n');
+}
+
+// Main fuzzy merge function using Levenshtein-based similarity matrix
+function fuzzyMergeOverlap(existing, fragment) {
+    if (!existing) return fragment;
+    if (!fragment) return existing;
+    if (fragment.trim().length < 30 && existing.trim().length > 100) return existing;
+
+    var aLines = existing.split('\n');
+    var bLines = fragment.split('\n');
+
+    // Determine search windows
+    var aSearchStart = Math.max(0, aLines.length - MERGE_SEARCH_WINDOW);
+    var aSearchEnd = aLines.length;
+    var bSearchStart = 0;
+    var bSearchEnd = Math.min(bLines.length, MERGE_CANDIDATE_WINDOW);
+
+    // Build similarity matrix between tail of A and head of B
+    var matrix = buildSimilarityMatrix(aLines, aSearchStart, aSearchEnd, bLines, bSearchStart, bSearchEnd);
+
+    var rows = aSearchEnd - aSearchStart;
+    var cols = bSearchEnd - bSearchStart;
+
+    // Find the best diagonal alignment
+    var alignment = findBestDiagonalAlignment(matrix, rows, cols);
+
+    if (alignment && alignment.maxConsecutive >= MERGE_MIN_CONSECUTIVE_MATCHES) {
+        log('FuzzyMerge: found alignment score=' + alignment.score.toFixed(2) +
+            ' avgSim=' + alignment.avgSimilarity.toFixed(3) +
+            ' consecutive=' + alignment.maxConsecutive +
+            ' reachesEnd=' + alignment.reachesEndOfA);
+        return computeMergeResult(aLines, bLines, alignment, aSearchStart);
+    }
+
+    // No good fuzzy alignment found - fall back to simple concatenation
+    // But first check for mid-line split
+    if (detectMidLineSplit(aLines, bLines)) {
+        var firstBIdx = 0;
+        while (firstBIdx < bLines.length && bLines[firstBIdx].trim() === '') firstBIdx++;
+        var joinedLine = aLines[aLines.length - 1] + bLines[firstBIdx];
+        var headLines = aLines.slice(0, aLines.length - 1);
+        var tailLines = bLines.slice(firstBIdx + 1);
+        log('FuzzyMerge: mid-line split detected, joining');
+        var res = headLines.join('\n');
+        if (res.length > 0) res += '\n';
+        res += joinedLine;
+        if (tailLines.length > 0) res += '\n' + tailLines.join('\n');
+        return res;
+    }
+
+    log('FuzzyMerge: no overlap found, concatenating');
+    return existing + '\n' + fragment;
+}
+
+// Updated mergeOverlap that uses the new fuzzy approach
+function mergeOverlap(existing, fragment) {
+    if (!existing) return fragment;
+    if (!fragment) return existing;
+    if (fragment.trim().length < 30 && existing.trim().length > 100) return existing;
+
+    var aLines = existing.split('\n');
+    var bLines = fragment.split('\n');
+
+    // First try exact overlap (fast path)
+    var exact = findExactOverlap(aLines, bLines);
+    if (exact >= 3) {
+        log('Merge: exact overlap of ' + exact + ' lines');
+        var remainder = bLines.slice(exact);
+        if (remainder.length === 0) return aLines.join('\n');
+        return aLines.join('\n') + '\n' + remainder.join('\n');
+    }
+
+    // Try the old truncation-aware overlap (still useful for clear truncation cases)
+    var truncOverlap = findOverlapWithTruncation(aLines, bLines);
+    if (truncOverlap) {
+        log('Merge: truncation-aware overlap at posA=' + truncOverlap.posA + ' startB=' + truncOverlap.startB);
+        var head = aLines.slice(0, truncOverlap.posA);
+        var tail = bLines.slice(truncOverlap.startB);
+        if (head.length === 0) return tail.join('\n');
+        return head.join('\n') + '\n' + tail.join('\n');
+    }
+
+    // Try old partial overlap (exact line matching)
+    var partial = findPartialOverlap(aLines, bLines);
+    if (partial && partial.matchLen >= 3) {
+        log('Merge: partial overlap at posA=' + partial.posA + ' startB=' + partial.startB + ' len=' + partial.matchLen);
+        var headP = aLines.slice(0, partial.posA);
+        var tailP = bLines.slice(partial.startB);
+        if (headP.length === 0) return tailP.join('\n');
+        return headP.join('\n') + '\n' + tailP.join('\n');
+    }
+
+    // Now try the fuzzy Levenshtein-based approach
+    return fuzzyMergeOverlap(existing, fragment);
+}
 
 function getRawTail() {
     var code = getLastCodeFromDOM();
@@ -628,26 +864,22 @@ function harvestAllCode() {
             }
         }
     }
-    // NEW: If DOM harvest failed but we have accumulated code, use that
     if ((!allCode || allCode.trim().length < 50) && accumulated && accumulated.trim().length > 50) {
         log('Harvest: DOM harvest insufficient, using accumulated code');
         allCode = accumulated;
     }
-    // NEW: Also try raw text extraction as last resort
     if (!allCode || allCode.trim().length < 50) {
         allCode = harvestFromRawText(turns);
     }
     return allCode.trim();
 }
 
-// NEW: Fallback harvest that extracts code from raw text content
 function harvestFromRawText(turns) {
     var allText = '';
     for (var i = 0; i < turns.length; i++) {
         var text = turns[i].innerText || turns[i].textContent || '';
         allText += text + '\n';
     }
-    // Try to find code between fence markers in the raw text
     var codeBlocks = [];
     var fenceRegex = new RegExp(FENCE + '[^\\n]*\\n([\\s\\S]*?)' + FENCE, 'g');
     var match;
@@ -687,7 +919,6 @@ function doHarvest() {
             var figureCount = qsa('figure[aria-label="Code Block"]', getChatRoot()).length;
             setStatus('\u26A0 No valid code found. Turns: ' + turnCount + ', pre: ' + preCount + ', code: ' + codeElCount + ', figures: ' + figureCount);
             log('Harvest failed. Turns: ' + turnCount + ', pre: ' + preCount + ', code els: ' + codeElCount + ', figures: ' + figureCount);
-            // NEW: Show diagnostic info
             log('Harvest diagnostic: accumulated length = ' + accumulated.length);
             var lastEl = getLastAnswerTurnEl();
             if (lastEl) {
@@ -837,10 +1068,6 @@ function createBlockUI(code) {
     return wrapper;
 }
 
-// ============================================================
-// DOWNLOAD HELPER
-// ============================================================
-
 function downloadFile(content, filename, mimeType) {
     var a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([content], { type: mimeType }));
@@ -959,8 +1186,6 @@ function handleResponse() {
     decideNextAction(text);
 }
 
-
-
 // ============================================================
 // CONTINUE SCHEDULING
 // ============================================================
@@ -983,7 +1208,6 @@ function doSubmitContinue() {
 
     setStatus('\u23F3 Continuing (' + continues + '/' + MAX + ')...');
 
-    // NEW: Check for mid-run instructions
     var prompt = buildContinuePrompt();
     if (midRunInstructions.length > 0) {
         var instructions = midRunInstructions.join('\n');
@@ -1170,60 +1394,6 @@ function detectMidLineSplit(aLines, bLines) {
     return true;
 }
 
-function mergeOverlap(existing, fragment) {
-    if (!existing) return fragment;
-    if (!fragment) return existing;
-    if (fragment.trim().length < 30 && existing.trim().length > 100) return existing;
-
-    var aLines = existing.split('\n');
-    var bLines = fragment.split('\n');
-
-    var truncOverlap = findOverlapWithTruncation(aLines, bLines);
-    if (truncOverlap) {
-        log('Merge: truncation-aware overlap at posA=' + truncOverlap.posA + ' startB=' + truncOverlap.startB);
-        var head = aLines.slice(0, truncOverlap.posA);
-        var tail = bLines.slice(truncOverlap.startB);
-        if (head.length === 0) return tail.join('\n');
-        return head.join('\n') + '\n' + tail.join('\n');
-    }
-
-    fixTruncatedTail(aLines, bLines);
-
-    var exact = findExactOverlap(aLines, bLines);
-    if (exact > 0) {
-        log('Merge: exact overlap of ' + exact + ' lines');
-        var remainder = bLines.slice(exact);
-        if (remainder.length === 0) return aLines.join('\n');
-        return aLines.join('\n') + '\n' + remainder.join('\n');
-    }
-
-    var partial = findPartialOverlap(aLines, bLines);
-    if (partial) {
-        log('Merge: partial overlap at posA=' + partial.posA + ' startB=' + partial.startB + ' truncated=' + partial.truncatedTail);
-        var headP = aLines.slice(0, partial.posA);
-        var tailP = bLines.slice(partial.startB);
-        if (headP.length === 0) return tailP.join('\n');
-        return headP.join('\n') + '\n' + tailP.join('\n');
-    }
-
-    if (detectMidLineSplit(aLines, bLines)) {
-        var firstBIdx = 0;
-        while (firstBIdx < bLines.length && bLines[firstBIdx].trim() === '') firstBIdx++;
-        var joinedLine = aLines[aLines.length - 1] + bLines[firstBIdx];
-        var headLines = aLines.slice(0, aLines.length - 1);
-        var tailLines = bLines.slice(firstBIdx + 1);
-        log('Merge: mid-line split detected, joining last line of A with first line of B');
-        var result = headLines.join('\n');
-        if (result.length > 0) result += '\n';
-        result += joinedLine;
-        if (tailLines.length > 0) result += '\n' + tailLines.join('\n');
-        return result;
-    }
-
-    log('Merge: no overlap found, concatenating');
-    return aLines.join('\n') + '\n' + bLines.join('\n');
-}
-
 function buildContinuePrompt() {
     var tail = lastRawTail || getLastNLines(accumulated, OVERLAP_LINES);
     var noFenceWarning = 'IMPORTANT: Do NOT start your response with ' + FENCE + ' or any code fence. You are continuing MID-CODE inside an already-open code block. Just write the next lines of code directly.';
@@ -1233,10 +1403,8 @@ function buildContinuePrompt() {
         noFenceWarning,
         '',
         'CRITICAL: Start by repeating at least the last 3 lines shown above, then continue with new code after them. This overlap is required for proper merging.',
-
         '',
         'If you are NOT done yet, just stop mid-code. I will ask you to continue.',
-
         "Make sure you start code blocks with 3 backticks again, so it works. And make also sure you do not write backticks inside of them to not leave the code."
     ].join('\n');
 }
@@ -1247,9 +1415,7 @@ function buildInitialPrompt(userText) {
         '=== RULES ===',
         'Write the complete code in a single code block.',
         'If you run out of space, just stop mid-code. I will ask you to continue.',
-
         '',
-
         "Make sure you start code blocks with 3 backticks again, so it works. And make also sure you do not write backticks inside of them to not leave the code.",
         '============='
     ].join('\n');
@@ -1265,7 +1431,7 @@ function finish() {
     if (responseHandleTimeout) { clearTimeout(responseHandleTimeout); responseHandleTimeout = null; }
     if (pollTimeout) { clearTimeout(pollTimeout); pollTimeout = null; }
     isProcessingResponse = false;
-    midRunInstructions = []; // Clear any pending mid-run instructions
+    midRunInstructions = [];
     markDone();
     updateBtn();
     var code = accumulated.trim();
@@ -1295,7 +1461,7 @@ function start(prompt) {
     prevHadUnclosedBlock = false;
     lastHarvestedText = '';
     showMergedOutput = false;
-    midRunInstructions = []; // Clear mid-run instructions on fresh start
+    midRunInstructions = [];
     lastTurns = getTurnCount();
     lastSeenTextLength = 0;
     stableCheckCount = 0;
@@ -1350,23 +1516,20 @@ function toggle() {
     start(text);
 }
 
-// NEW: Handle mid-run input submission
 function handleMidRunInput() {
     var input = qs('#acl-input');
     var text = input.value.trim();
     if (!text) return;
     if (!running) {
-        // Not running, start normally
         input.value = '';
         start(text);
         return;
     }
-    // Running: save instruction for next continue
     midRunInstructions.push(text);
     input.value = '';
     setStatus('\uD83D\uDCDD Instruction queued (' + midRunInstructions.length + ' pending): "' + text.substring(0, 40) + (text.length > 40 ? '...' : '') + '"');
     log('Mid-run instruction queued: ' + text.substring(0, 80));
-    playTone(660, 0, 0.1); // Short confirmation beep
+    playTone(660, 0, 0.1);
 }
 
 // ============================================================
@@ -1415,7 +1578,6 @@ function buildStyles() {
         '#acl-panel-bar{display:flex;gap:10px;padding:14px;border-top:1px solid rgba(139,92,246,.2);background:rgba(0,0,0,.3);flex-wrap:wrap;}',
         '#acl-panel-bar button{padding:10px 20px;border:none;border-radius:10px;cursor:pointer;font:600 12px/1 sans-serif;transition:all .15s;}',
         '#acl-panel-bar button:hover{transform:scale(1.03);}',
-        '#acl-input.has-queued{border-color:#f59e0b;box-shadow:0 0 0 3px rgba(245,158,11,.2);}',
         'body{padding-bottom:' + (barHeight + 10) + 'px !important;transition:padding-bottom .2s;}'
     ].join('\n');
 }
@@ -1494,7 +1656,6 @@ function attachEventListeners() {
         downloadFile(accumulated.trim(), 'output.html', 'text/html');
     });
 
-    // ResizeObserver for dynamic body padding
     if (window.ResizeObserver) {
         var ro = new ResizeObserver(function() { updateBodyPadding(); });
         ro.observe(qs('#acl-bar'));
@@ -1562,7 +1723,6 @@ if (!document.body) {
     bodyObserver.observe(document.documentElement, { childList: true });
 }
 
-// Periodic check: re-init UI if removed, update body padding, update input visual
 setInterval(function() {
     if (!qs('#acl-bar') && document.body) initUI();
     updateBodyPadding();
@@ -1575,7 +1735,7 @@ setInterval(function() {
 }, STREAM_CHECK_INTERVAL);
 
 // ============================================================
-// TEST SUITE
+// TEST SUITE - COMPREHENSIVE MERGE TESTS
 // ============================================================
 
 function createTestReport(results) {
@@ -1585,7 +1745,7 @@ function createTestReport(results) {
         else { failed++; errors.push(results[i]); }
     }
     console.log('\n%c' + Array(44).join('='), 'color:#7c3aed;font-weight:bold');
-    console.log('%c  AUTO-CODER v14 TEST RESULTS', 'color:#c4b5fd;font-weight:bold;font-size:14px');
+    console.log('%c  AUTO-CODER v15 TEST RESULTS', 'color:#c4b5fd;font-weight:bold;font-size:14px');
     console.log('%c' + Array(44).join('='), 'color:#7c3aed;font-weight:bold');
     console.log('%c  Passed: ' + passed, 'color:#34d399;font-weight:bold');
     console.log('%c  Failed: ' + failed, 'color:#f87171;font-weight:bold');
@@ -1595,6 +1755,8 @@ function createTestReport(results) {
         console.log('\n%cFailed Tests:', 'color:#f87171;font-weight:bold');
         for (var j = 0; j < errors.length; j++) {
             console.log('%c  X ' + errors[j].name + ': ' + errors[j].msg, 'color:#fca5a5');
+            if (errors[j].expected) console.log('    Expected: ' + errors[j].expected.replace(/\n/g, '|'));
+            if (errors[j].got) console.log('    Got:      ' + errors[j].got.replace(/\n/g, '|'));
         }
     }
     return { passed: passed, failed: failed, total: results.length, errors: errors };
@@ -1606,9 +1768,35 @@ function assert(results, name, condition, msg) {
     else console.log('  V ' + name);
 }
 
+function assertMerge(results, name, a, b, expected) {
+    var got = mergeOverlap(a, b);
+    var pass = got === expected;
+    results.push({
+        name: name,
+        pass: pass,
+        msg: pass ? 'OK' : 'Mismatch',
+        expected: expected,
+        got: got
+    });
+    if (!pass) {
+        console.warn('  X ' + name);
+        console.warn('    A: ' + (a || '').replace(/\n/g, '|'));
+        console.warn('    B: ' + (b || '').replace(/\n/g, '|'));
+        console.warn('    Expected: ' + expected.replace(/\n/g, '|'));
+        console.warn('    Got:      ' + got.replace(/\n/g, '|'));
+    } else {
+        console.log('  V ' + name);
+    }
+}
+
 window.test_auto_continue = function() {
     var results = [];
-    console.log('\n%cRunning Auto-Coder v14 Test Suite...', 'color:#a855f7;font-weight:bold;font-size:13px');
+    console.log('\n%cRunning Auto-Coder v15 Test Suite...', 'color:#a855f7;font-weight:bold;font-size:13px');
+
+    // ============================================================
+    // BASIC INFRASTRUCTURE TESTS
+    // ============================================================
+    console.log('\n%c--- Infrastructure Tests ---', 'color:#60a5fa;font-weight:bold');
 
     var chatRoot = getChatRoot();
     assert(results, 'getChatRoot finds element', chatRoot !== null, chatRoot ? (chatRoot.id || chatRoot.tagName) : 'null');
@@ -1625,41 +1813,6 @@ window.test_auto_continue = function() {
     var ta = getTextarea();
     assert(results, 'getTextarea finds textarea', ta !== null, ta ? ta.id : 'NOT FOUND');
 
-    var m1 = mergeOverlap('a\nb\nc\nd\ne', 'd\ne\nf\ng');
-    assert(results, 'mergeOverlap exact overlap', m1 === 'a\nb\nc\nd\ne\nf\ng', m1.replace(/\n/g, '|'));
-
-    var m2 = mergeOverlap('x\ny\nz', 'a\nb\nc');
-    assert(results, 'mergeOverlap no overlap concat', m2 === 'x\ny\nz\na\nb\nc', m2.replace(/\n/g, '|'));
-
-    var m3 = mergeOverlap('a\nb\nc', 'a\nb\nc');
-    assert(results, 'mergeOverlap identical dedup', m3 === 'a\nb\nc', m3.replace(/\n/g, '|'));
-
-    assert(results, 'isCodeIncomplete unclosed HTML', isCodeIncomplete('<!DOCTYPE html><html><body>') === true, '');
-    assert(results, 'isCodeIncomplete closed HTML', isCodeIncomplete('<!DOCTYPE html><html></html>') === false, '');
-
-    var initPrompt = buildInitialPrompt('test prompt');
-    assert(results, 'buildInitialPrompt has user text', initPrompt.indexOf('test prompt') !== -1, '');
-    assert(results, 'buildInitialPrompt has rules', initPrompt.indexOf('=== RULES ===') !== -1, '');
-
-    var savedAcc = accumulated;
-    var savedTail = lastRawTail;
-    accumulated = 'line1\nline2\nline3\nline4\nline5';
-    lastRawTail = 'line3\nline4\nline5';
-    var contPrompt = buildContinuePrompt();
-    assert(results, 'buildContinuePrompt has tail', contPrompt.indexOf('line5') !== -1, '');
-    assert(results, 'buildContinuePrompt warns about fences', contPrompt.indexOf('Do NOT start') !== -1, '');
-    assert(results, 'buildContinuePrompt has FENCE', contPrompt.indexOf(FENCE) !== -1, '');
-    accumulated = savedAcc;
-    lastRawTail = savedTail;
-
-    // NEW: Test mid-run instructions
-    midRunInstructions = [];
-    midRunInstructions.push('test instruction');
-    assert(results, 'midRunInstructions queue works', midRunInstructions.length === 1, 'Length: ' + midRunInstructions.length);
-    midRunInstructions = [];
-
-    assert(results, 'showMergedOutput flag exists', typeof showMergedOutput === 'boolean', 'Value: ' + showMergedOutput);
-
     assert(results, 'UI bar exists', qs('#acl-bar') !== null, '');
     assert(results, 'UI input exists', qs('#acl-input') !== null, '');
     assert(results, 'UI btn exists', qs('#acl-btn') !== null, '');
@@ -1668,10 +1821,272 @@ window.test_auto_continue = function() {
     assert(results, 'UI wait exists', qs('#acl-wait') !== null, '');
 
     assert(results, 'countFences works', countFences(FENCE + 'js\ncode\n' + FENCE) === 2, '');
-
-    // NEW: Test harvestFromRawText exists
     assert(results, 'harvestFromRawText function exists', typeof harvestFromRawText === 'function', '');
+    assert(results, 'fuzzyMergeOverlap function exists', typeof fuzzyMergeOverlap === 'function', '');
+    assert(results, 'levenshteinDistance function exists', typeof levenshteinDistance === 'function', '');
+    assert(results, 'lineSimilarity function exists', typeof lineSimilarity === 'function', '');
 
+    // ============================================================
+    // LEVENSHTEIN DISTANCE TESTS
+    // ============================================================
+    console.log('\n%c--- Levenshtein Distance Tests ---', 'color:#60a5fa;font-weight:bold');
+
+    assert(results, 'levenshtein: identical strings', levenshteinDistance('hello', 'hello') === 0, '');
+    assert(results, 'levenshtein: one char diff', levenshteinDistance('hello', 'hallo') === 1, 'Got: ' + levenshteinDistance('hello', 'hallo'));
+    assert(results, 'levenshtein: insertion', levenshteinDistance('hello', 'helloo') === 1, 'Got: ' + levenshteinDistance('hello', 'helloo'));
+    assert(results, 'levenshtein: deletion', levenshteinDistance('hello', 'helo') === 1, 'Got: ' + levenshteinDistance('hello', 'helo'));
+    assert(results, 'levenshtein: empty vs string', levenshteinDistance('', 'abc') === 3, 'Got: ' + levenshteinDistance('', 'abc'));
+    assert(results, 'levenshtein: both empty', levenshteinDistance('', '') === 0, '');
+
+    // ============================================================
+    // LINE SIMILARITY TESTS
+    // ============================================================
+    console.log('\n%c--- Line Similarity Tests ---', 'color:#60a5fa;font-weight:bold');
+
+    assert(results, 'lineSimilarity: identical', lineSimilarity('function foo() {', 'function foo() {') === 1.0, '');
+    assert(results, 'lineSimilarity: both empty', lineSimilarity('', '') === 1.0, '');
+    assert(results, 'lineSimilarity: one empty', lineSimilarity('hello', '') === 0.0, '');
+
+    var sim1 = lineSimilarity('  var x = 42;', '  var x = 43;');
+    assert(results, 'lineSimilarity: one char diff high sim', sim1 > 0.9, 'Got: ' + sim1.toFixed(3));
+
+    var sim2 = lineSimilarity('function handleClick(event) {', 'function handleClck(event) {');
+    assert(results, 'lineSimilarity: typo still high sim', sim2 > 0.9, 'Got: ' + sim2.toFixed(3));
+
+    var sim3 = lineSimilarity('completely different line', 'nothing in common here at all xyz');
+    assert(results, 'lineSimilarity: totally different low sim', sim3 < 0.4, 'Got: ' + sim3.toFixed(3));
+
+    var sim4 = lineSimilarity('  return result;', '  return result;  ');
+    assert(results, 'lineSimilarity: trailing space ignored (trim)', sim4 === 1.0, 'Got: ' + sim4.toFixed(3));
+
+    // ============================================================
+    // MERGE OVERLAP TESTS - 10 COMPREHENSIVE USE CASES
+    // ============================================================
+    console.log('\n%c--- Merge Overlap Tests (10 Use Cases) ---', 'color:#60a5fa;font-weight:bold');
+
+    // TEST 1: Perfect exact overlap (easy case)
+    console.log('%c  Test 1: Perfect exact overlap', 'color:#94a3b8');
+    assertMerge(results, 'Merge #1: perfect exact overlap',
+        'line1\nline2\nline3\nline4\nline5',
+        'line4\nline5\nline6\nline7',
+        'line1\nline2\nline3\nline4\nline5\nline6\nline7'
+    );
+
+    // TEST 2: No overlap at all (concatenation)
+    console.log('%c  Test 2: No overlap - concatenation', 'color:#94a3b8');
+    assertMerge(results, 'Merge #2: no overlap concatenation',
+        'alpha\nbeta\ngamma',
+        'delta\nepsilon\nzeta',
+        'alpha\nbeta\ngamma\ndelta\nepsilon\nzeta'
+    );
+
+    // TEST 3: Identical texts (full dedup)
+    console.log('%c  Test 3: Identical texts', 'color:#94a3b8');
+    assertMerge(results, 'Merge #3: identical dedup',
+        'foo\nbar\nbaz',
+        'foo\nbar\nbaz',
+        'foo\nbar\nbaz'
+    );
+
+    // TEST 4: One character typo in overlap region (fuzzy match)
+    console.log('%c  Test 4: Typo in overlap (fuzzy)', 'color:#94a3b8');
+    var test4a = 'function init() {\n  var x = 1;\n  var y = 2;\n  console.log(x);\n  console.log(y);';
+    var test4b = '  var y = 2;\n  console.log(x);\n  console.log(y);\n  return x + y;\n}';
+    var test4expected = 'function init() {\n  var x = 1;\n  var y = 2;\n  console.log(x);\n  console.log(y);\n  return x + y;\n}';
+    assertMerge(results, 'Merge #4: exact overlap in code',
+        test4a, test4b, test4expected
+    );
+
+    // TEST 5: Typo in overlap - one character different (fuzzy should handle)
+    console.log('%c  Test 5: Typo in overlap line (fuzzy)', 'color:#94a3b8');
+    var test5a = 'function render() {\n  var canvas = getCanvas();\n  var ctx = canvas.getContext("2d");\n  ctx.clearRect(0, 0, 800, 600);\n  ctx.fillStyle = "#ff0';
+    var test5b = '  var ctx = canvas.getContext("2d");\n  ctx.clearRect(0, 0, 800, 600);\n  ctx.fillStyle = "#ff0000";\n  ctx.fillRect(10, 10, 50, 50);\n}';
+    var test5result = mergeOverlap(test5a, test5b);
+    // The result should contain the beginning of A and the end of B, without duplication
+    var test5pass = test5result.indexOf('function render()') === 0 &&
+                    test5result.indexOf('ctx.fillRect(10, 10, 50, 50)') !== -1 &&
+                    test5result.indexOf('}') !== -1 &&
+                    // Should not have duplicate "ctx.clearRect" lines
+                    (test5result.match(/ctx\.clearRect/g) || []).length === 1;
+    results.push({
+        name: 'Merge #5: typo/truncation in overlap',
+        pass: test5pass,
+        msg: test5pass ? 'OK' : 'Merge did not handle truncated overlap correctly',
+        expected: '(contains render, fillRect, single clearRect)',
+        got: test5result.replace(/\n/g, '|')
+    });
+    if (!test5pass) console.warn('  X Merge #5: ' + test5result.replace(/\n/g, '|'));
+    else console.log('  V Merge #5');
+
+    // TEST 6: Overlap with extra whitespace differences
+    console.log('%c  Test 6: Whitespace differences in overlap', 'color:#94a3b8');
+    var test6a = 'line1\n  line2\n    line3\n      line4';
+    var test6b = '  line2\n    line3\n      line4\n        line5\n          line6';
+    var test6expected = 'line1\n  line2\n    line3\n      line4\n        line5\n          line6';
+    assertMerge(results, 'Merge #6: whitespace preserved overlap',
+        test6a, test6b, test6expected
+    );
+
+    // TEST 7: Overlap where B starts with blank lines before the overlap
+    console.log('%c  Test 7: B starts with blank lines', 'color:#94a3b8');
+    var test7a = 'alpha\nbeta\ngamma\ndelta';
+    var test7b = '\n\ngamma\ndelta\nepsilon\nzeta';
+    var test7expected = 'alpha\nbeta\ngamma\ndelta\nepsilon\nzeta';
+    assertMerge(results, 'Merge #7: B has leading blank lines',
+        test7a, test7b, test7expected
+    );
+
+    // TEST 8: Large overlap (many lines match)
+    console.log('%c  Test 8: Large overlap (8 lines)', 'color:#94a3b8');
+    var test8a = 'line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10';
+    var test8b = 'line3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nline12';
+    var test8expected = 'line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nline12';
+    assertMerge(results, 'Merge #8: large 8-line overlap',
+        test8a, test8b, test8expected
+    );
+
+    // TEST 9: Mid-line truncation (A's last line is cut off, B has the full version)
+    console.log('%c  Test 9: Mid-line truncation', 'color:#94a3b8');
+    var test9a = 'function foo() {\n  var result = computeSomething(\n    param1, param2, par';
+    var test9b = '  var result = computeSomething(\n    param1, param2, param3\n  );\n  return result;\n}';
+    var test9result = mergeOverlap(test9a, test9b);
+    var test9pass = test9result.indexOf('function foo()') === 0 &&
+                    test9result.indexOf('param3') !== -1 &&
+                    test9result.indexOf('return result;') !== -1 &&
+                    (test9result.match(/computeSomething/g) || []).length === 1;
+    results.push({
+        name: 'Merge #9: mid-line truncation',
+        pass: test9pass,
+        msg: test9pass ? 'OK' : 'Mid-line truncation not handled',
+        expected: '(contains foo, param3, return, single computeSomething)',
+        got: test9result.replace(/\n/g, '|')
+    });
+    if (!test9pass) console.warn('  X Merge #9: ' + test9result.replace(/\n/g, '|'));
+    else console.log('  V Merge #9');
+
+    // TEST 10: B is a subset of A (should not duplicate)
+    console.log('%c  Test 10: B is subset of A', 'color:#94a3b8');
+    var test10a = 'line1\nline2\nline3\nline4\nline5';
+    var test10b = 'line3\nline4\nline5';
+    var test10expected = 'line1\nline2\nline3\nline4\nline5';
+    assertMerge(results, 'Merge #10: B is subset of A (no growth)',
+        test10a, test10b, test10expected
+    );
+
+    // TEST 11: Fuzzy overlap with multiple small differences
+    console.log('%c  Test 11: Multiple small diffs in overlap (fuzzy)', 'color:#94a3b8');
+    var test11a = [
+        'function processData(items) {',
+        '  var results = [];',
+        '  for (var i = 0; i < items.length; i++) {',
+        '    var item = items[i];',
+        '    results.push(transform(item));'
+    ].join('\n');
+    var test11b = [
+        '  for (var i = 0; i < items.length; i++) {',
+        '    var item = items[i];',
+        '    results.push(transform(item));',
+        '  }',
+        '  return results;',
+        '}'
+    ].join('\n');
+    var test11result = mergeOverlap(test11a, test11b);
+    var test11pass = test11result.indexOf('function processData') === 0 &&
+                     test11result.indexOf('return results;') !== -1 &&
+                     (test11result.match(/for \(var i/g) || []).length === 1;
+    results.push({
+        name: 'Merge #11: multi-line overlap with exact match',
+        pass: test11pass,
+        msg: test11pass ? 'OK' : 'Multi-line overlap failed',
+        expected: '(single for loop, has return results)',
+        got: test11result.replace(/\n/g, '|')
+    });
+    if (!test11pass) console.warn('  X Merge #11: ' + test11result.replace(/\n/g, '|'));
+    else console.log('  V Merge #11');
+
+    // TEST 12: Empty existing, non-empty fragment
+    console.log('%c  Test 12: Empty existing', 'color:#94a3b8');
+    assertMerge(results, 'Merge #12: empty existing returns fragment',
+        '', 'new code here\nline2', 'new code here\nline2'
+    );
+
+    // TEST 13: Non-empty existing, empty fragment
+    console.log('%c  Test 13: Empty fragment', 'color:#94a3b8');
+    assertMerge(results, 'Merge #13: empty fragment returns existing',
+        'existing code\nline2', '', 'existing code\nline2'
+    );
+
+    // ============================================================
+    // FUZZY MERGE SPECIFIC TESTS
+    // ============================================================
+    console.log('\n%c--- Fuzzy Merge Specific Tests ---', 'color:#60a5fa;font-weight:bold');
+
+    // Test fuzzyMergeOverlap directly with lines that have typos
+    var fuzzy1a = [
+        'function calculate() {',
+        '  var sum = 0;',
+        '  for (var i = 0; i < 10; i++) {',
+        '    sum += i * 2;',
+        '    console.log(sum);'
+    ].join('\n');
+    var fuzzy1b = [
+        '  for (var i = 0; i < 10; i++) {',
+        '    sum += i * 2;',
+        '    consol.log(sum);',  // typo: consol instead of console
+        '  }',
+        '  return sum;',
+        '}'
+    ].join('\n');
+    var fuzzy1result = fuzzyMergeOverlap(fuzzy1a, fuzzy1b);
+    var fuzzy1pass = fuzzy1result.indexOf('function calculate()') === 0 &&
+                     fuzzy1result.indexOf('return sum;') !== -1 &&
+                     (fuzzy1result.match(/for \(var i/g) || []).length === 1;
+    results.push({
+        name: 'FuzzyMerge: typo in overlap line (consol vs console)',
+        pass: fuzzy1pass,
+        msg: fuzzy1pass ? 'OK' : 'Fuzzy merge failed with typo',
+        expected: '(single for loop, has return sum)',
+        got: fuzzy1result.replace(/\n/g, '|')
+    });
+    if (!fuzzy1pass) console.warn('  X FuzzyMerge typo: ' + fuzzy1result.replace(/\n/g, '|'));
+    else console.log('  V FuzzyMerge typo');
+
+    // Test similarity matrix building
+    var matrixTestA = ['line1', 'line2', 'line3'];
+    var matrixTestB = ['line2', 'line3', 'line4'];
+    var testMatrix = buildSimilarityMatrix(matrixTestA, 0, 3, matrixTestB, 0, 3);
+    assert(results, 'buildSimilarityMatrix dimensions correct',
+        testMatrix.length === 3 && testMatrix[0].length === 3,
+        'Got ' + testMatrix.length + 'x' + (testMatrix[0] ? testMatrix[0].length : 0));
+    assert(results, 'buildSimilarityMatrix diagonal match',
+        testMatrix[1][0] === 1.0 && testMatrix[2][1] === 1.0,
+        'line2-line2=' + testMatrix[1][0] + ' line3-line3=' + testMatrix[2][1]);
+
+    // Test findBestDiagonalAlignment
+    var alignMatrix = buildSimilarityMatrix(
+        ['a', 'b', 'c', 'd', 'e'], 2, 5,  // tail: c, d, e
+        ['c', 'd', 'e', 'f', 'g'], 0, 5    // head: c, d, e, f, g
+    );
+    var alignment = findBestDiagonalAlignment(alignMatrix, 3, 5);
+    assert(results, 'findBestDiagonalAlignment finds correct offset',
+        alignment !== null && alignment.aOffset === 0 && alignment.bOffset === 0,
+        alignment ? 'aOff=' + alignment.aOffset + ' bOff=' + alignment.bOffset : 'null');
+
+    // ============================================================
+    // CODE COMPLETENESS TESTS
+    // ============================================================
+    console.log('\n%c--- Code Completeness Tests ---', 'color:#60a5fa;font-weight:bold');
+
+    assert(results, 'isCodeIncomplete: unclosed HTML', isCodeIncomplete('<!DOCTYPE html><html><body>') === true, '');
+    assert(results, 'isCodeIncomplete: closed HTML', isCodeIncomplete('<!DOCTYPE html><html><body></body></html>') === false, '');
+    assert(results, 'isCodeIncomplete: unclosed brace', isCodeIncomplete('function foo() {\n  var x = 1;\n  if (x) {\n    return x;') === true, '');
+    assert(results, 'isCodeIncomplete: balanced braces', isCodeIncomplete('function foo() {\n  return 1;\n}') === false, '');
+    assert(results, 'isCodeIncomplete: unclosed script', isCodeIncomplete('<!DOCTYPE html><html><body><script>\nvar x = 1;') === true, '');
+    assert(results, 'isCodeIncomplete: IIFE complete', isCodeIncomplete('(function() {\n  var x = 1;\n})();') === false, '');
+
+    // ============================================================
+    // FINAL REPORT
+    // ============================================================
     return createTestReport(results);
 };
 
@@ -1700,6 +2115,11 @@ window.acl_debug = {
     harvest: harvestAllCode,
     isComplete: function(code) { return !isCodeIncomplete(code || accumulated); },
     testMerge: mergeOverlap,
+    testFuzzyMerge: fuzzyMergeOverlap,
+    testLevenshtein: levenshteinDistance,
+    testLineSimilarity: lineSimilarity,
+    testBuildMatrix: buildSimilarityMatrix,
+    testFindAlignment: findBestDiagonalAlignment,
     testIsDone: isDone,
     forceFinish: finish,
     forceContinue: function() {
@@ -1716,6 +2136,6 @@ window.acl_debug = {
     clearMidRunInstructions: function() { midRunInstructions = []; updateInputVisual(); }
 };
 
-log('Auto-Coder v14 loaded. Run test_auto_continue() in console to test. Use acl_debug for debugging.');
+log('Auto-Coder v15 loaded. Run test_auto_continue() in console to test. Use acl_debug for debugging.');
 
 })();
