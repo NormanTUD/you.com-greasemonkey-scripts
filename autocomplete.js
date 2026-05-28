@@ -1128,9 +1128,9 @@ function buildContinuePrompt() {
         '',
         'If you are NOT done yet, just stop mid-code. I will ask you to continue.',
         "Make sure you start code blocks with 3 backticks again, so it works. And make also sure you do not write backticks inside of them to not leave the code.",
-	"Write the ENTIRE file in ONE single code block. Do NOT split it across messages. If you cannot fit it all, stop mid-code WITHOUT closing the block — I will ask you to continue. When continuing, do NOT use triple backticks at all — just write raw code lines. Never use backtick characters (`) anywhere inside the code itself (not in template literals, not in comments, nowhere)."
-	"When continueing, make sure you overlap roughly 10 lines."
-        'Do NOT write AUTOCODER_FINISHED unless the code is truly 100% complete.',
+	"Write the ENTIRE file in ONE single code block. Do NOT split it across messages. If you cannot fit it all, stop mid-code WITHOUT closing the block — I will ask you to continue. When continuing, do NOT use triple backticks at all — just write raw code lines. Never use backtick characters (`) anywhere inside the code itself (not in template literals, not in comments, nowhere).",
+	"When continueing, make sure you overlap roughly 10 lines.",
+        'Do NOT write AUTOCODER_FINISHED unless the code is truly 100% complete.'
     ].join('\n');
 }
 
@@ -1145,7 +1145,7 @@ function buildInitialPrompt(userText) {
         'Do NOT write AUTOCODER_FINISHED unless the code is truly 100% complete.',
         "Make sure you start code blocks with 3 backticks again, so it works. And make also sure you do not write backticks inside of them to not leave the code.",
 	"Write the ENTIRE file in ONE single code block. Do NOT split it across messages. If you cannot fit it all, stop mid-code WITHOUT closing the block — I will ask you to continue. When continuing, do NOT use triple backticks at all — just write raw code lines. Never use backtick characters (`) anywhere inside the code itself (not in template literals, not in comments, nowhere).",
-	"When continueing, make sure you overlap roughly 10 lines."
+	"When continueing, make sure you overlap roughly 10 lines.",
         '============='
     ].join('\n');
 }
