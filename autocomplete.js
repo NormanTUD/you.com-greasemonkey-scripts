@@ -51,6 +51,9 @@ var debugLog = [];
 var showMergedOutput = false;
 var OVERLAP_LINES = 8;
 
+var UNCLOSED_FENCE_MAX_WAITS = 8;
+var unclosedFenceWaitCount = 0;
+
 function log(msg) {
     var entry = '[AutoCoder ' + new Date().toISOString().slice(11,19) + '] ' + msg;
     console.log(entry);
@@ -421,18 +424,11 @@ function isResponseFullySettled() {
     if (!el) return false;
     if (isTextStillChanging()) return false;
     if (stableCheckCount < STREAM_STABLE_CHECKS) return false;
-    var text = el.innerText || '';
-    if (countFences(text) % 2 !== 0) return false;
+    // NOTE: We no longer block on odd fence count here.
+    // An odd fence count with a fully stopped response means the AI
+    // stopped mid-code-block (truncated). We handle this in poll().
     return true;
 }
-
-
-
-
-
-
-
-
 
 function getRawTail() {
     var code = getLastCodeFromDOM();
@@ -658,11 +654,13 @@ function poll() {
     if (isGenerating()) {
         stableCheckCount = 0;
         lastSeenTextLength = 0;
+        unclosedFenceWaitCount = 0;
         pollTimeout = setTimeout(poll, POLL_MS);
         return;
     }
 
     if (isTextStillChanging()) {
+        unclosedFenceWaitCount = 0;
         pollTimeout = setTimeout(poll, STREAM_CHECK_INTERVAL);
         return;
     }
@@ -682,15 +680,22 @@ function poll() {
     if (el) {
         var text = el.innerText || '';
         if (countFences(text) % 2 !== 0) {
-            log('Fence count odd - code block still open, waiting...');
-            stableCheckCount = 0;
-            pollTimeout = setTimeout(poll, STREAM_CHECK_INTERVAL);
-            return;
+            unclosedFenceWaitCount++;
+            if (unclosedFenceWaitCount < UNCLOSED_FENCE_MAX_WAITS) {
+                log('Fence count odd - code block appears open, wait ' + unclosedFenceWaitCount + '/' + UNCLOSED_FENCE_MAX_WAITS);
+                stableCheckCount = 0;
+                pollTimeout = setTimeout(poll, STREAM_CHECK_INTERVAL);
+                return;
+            }
+            // Exceeded max waits - response truly stopped mid-code-block (truncated)
+            log('Fence count odd but response stopped after ' + unclosedFenceWaitCount + ' checks - treating as truncated');
+            unclosedFenceWaitCount = 0;
         }
     }
 
+    unclosedFenceWaitCount = 0;
     lastTurns = t;
-  
+
     if (responseHandleTimeout) clearTimeout(responseHandleTimeout);
     responseHandleTimeout = setTimeout(function() {
         handleResponseSafe();
@@ -719,16 +724,9 @@ function handleResponseSafe() {
         return;
     }
 
-    var el = getLastAnswerTurnEl();
-    if (el) {
-        var rawText = el.innerText || '';
-        if (countFences(rawText) % 2 !== 0) {
-            isProcessingResponse = false;
-            log('Fence still odd at handle time - retrying...');
-            pollTimeout = setTimeout(poll, STREAM_CHECK_INTERVAL);
-            return;
-        }
-    }
+    // NOTE: Removed the fence-count re-check here. If poll() already
+    // determined the response is done (possibly truncated mid-block),
+    // we should proceed to handle it, not loop back.
 
     handleResponse();
     isProcessingResponse = false;
@@ -1183,30 +1181,31 @@ function finish() {
 }
 
 function start(prompt) {
-    running = true;
-    continues = 0;
-    accumulated = '';
-    lastRawTail = '';
-    prevHadUnclosedBlock = false;
-    lastHarvestedText = '';
-    showMergedOutput = false; // FIX: Reset - don't show until finish
-    lastTurns = getTurnCount();
-    lastSeenTextLength = 0;
-    stableCheckCount = 0;
-    lastResponseText = '';
-    isProcessingResponse = false;
-    if (responseHandleTimeout) { clearTimeout(responseHandleTimeout); responseHandleTimeout = null; }
-    if (pollTimeout) { clearTimeout(pollTimeout); pollTimeout = null; }
+	running = true;
+	continues = 0;
+	accumulated = '';
+	lastRawTail = '';
+	prevHadUnclosedBlock = false;
+	lastHarvestedText = '';
+	showMergedOutput = false; // FIX: Reset - don't show until finish
+	lastTurns = getTurnCount();
+	lastSeenTextLength = 0;
+	stableCheckCount = 0;
+	lastResponseText = '';
+	unclosedFenceWaitCount = 0;
+	isProcessingResponse = false;
+	if (responseHandleTimeout) { clearTimeout(responseHandleTimeout); responseHandleTimeout = null; }
+	if (pollTimeout) { clearTimeout(pollTimeout); pollTimeout = null; }
 
-    // Remove old injected block if any
-    var oldBlock = document.getElementById('acl-injected-block');
-    if (oldBlock) oldBlock.remove();
+	// Remove old injected block if any
+	var oldBlock = document.getElementById('acl-injected-block');
+	if (oldBlock) oldBlock.remove();
 
-    incrementProcessing();
-    updateBtn();
-    setStatus('\u23F3 Submitting...');
-    submit(buildInitialPrompt(prompt));
-    pollTimeout = setTimeout(poll, INITIAL_POLL_DELAY);
+	incrementProcessing();
+	updateBtn();
+	setStatus('\u23F3 Submitting...');
+	submit(buildInitialPrompt(prompt));
+	pollTimeout = setTimeout(poll, INITIAL_POLL_DELAY);
 }
 
 function stop() {
