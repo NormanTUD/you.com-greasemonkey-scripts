@@ -24,6 +24,7 @@ var MIN_CODE_LENGTH_FOR_COMPLETE = 400;
 var INITIAL_POLL_DELAY = 7000;
 var CONTINUE_POLL_DELAY = 6000;
 
+var dockedRight = false;
 var running = false;
 var continues = 0;
 var lastTurns = 0;
@@ -1235,6 +1236,26 @@ function updateBtn() {
     btn.className = running ? 'acl-on' : '';
 }
 
+function toggleDockRight() {
+    var bar = qs('#acl-bar');
+    if (!bar) return;
+    dockedRight = !dockedRight;
+    if (dockedRight) {
+        bar.style.cssText = 'position:fixed;top:0;right:0;bottom:0;left:auto;z-index:9999999;display:flex;flex-direction:column;align-items:stretch;background:linear-gradient(90deg,#0d0820,#0a0814);border-left:1px solid rgba(139,92,246,.4);padding:8px 12px;gap:10px;font:13px "SF Mono",monospace;box-shadow:-4px 0 30px rgba(124,58,237,.15);width:320px;overflow-y:auto;';
+        document.body.style.paddingBottom = '';
+        document.body.style.paddingRight = '330px';
+        qs('#acl-move').textContent = '\u2B07';
+        qs('#acl-move').title = 'Move to bottom';
+    } else {
+        bar.style.cssText = '';
+        document.body.style.paddingRight = '';
+        updateBodyPadding();
+        qs('#acl-move').textContent = '\u2B95';
+        qs('#acl-move').title = 'Move to right side';
+    }
+}
+
+
 function toggle() {
     if (running) return stop();
     var input = qs('#acl-input');
@@ -1289,12 +1310,16 @@ function buildStyles() {
         '#acl-panel-bar{display:flex;gap:10px;padding:14px;border-top:1px solid rgba(139,92,246,.2);background:rgba(0,0,0,.3);flex-wrap:wrap;}',
         '#acl-panel-bar button{padding:10px 20px;border:none;border-radius:10px;cursor:pointer;font:600 12px/1 sans-serif;transition:all .15s;}',
         '#acl-panel-bar button:hover{transform:scale(1.03);}',
-        'body{padding-bottom:' + (barHeight + 10) + 'px !important;transition:padding-bottom .2s;}'
+        'body{padding-bottom:' + (barHeight + 10) + 'px !important;transition:padding-bottom .2s;}',
+	'#acl-move{width:44px;height:40px;border:none;border-radius:10px;cursor:pointer;background:linear-gradient(135deg,#4f46e5,#4338ca);color:#fff;font-size:18px;transition:all .15s;box-shadow:0 4px 15px rgba(79,70,229,.4);flex-shrink:0;}',
+	'#acl-move:hover{transform:scale(1.05);}',
+
     ].join('\n');
 }
 
 function buildBarHTML() {
     return [
+        '<button id="acl-move" title="Move to right side">\u2B95</button>',
         '<textarea id="acl-input" placeholder="\u2728 Enter prompt... (Enter to start, Shift+Enter for newline)" rows="1"></textarea>',
         '<button id="acl-btn">\u25B6</button>',
         '<button id="acl-harvest">\uD83C\uDF3E Harvest</button>',
@@ -1319,33 +1344,35 @@ function buildPanelHTML() {
 }
 
 function attachEventListeners() {
-    var input = qs('#acl-input');
-    input.addEventListener('keydown', function(e) {
-        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); toggle(); }
-    });
-    input.addEventListener('input', function() {
-        this.style.height = 'auto';
-        var newH = Math.min(this.scrollHeight, 300);
-        this.style.height = newH + 'px';
-        updateBodyPadding();
-    });
-    qs('#acl-btn').addEventListener('click', toggle);
-    qs('#acl-harvest').addEventListener('click', doHarvest);
-    qs('#acl-skip').addEventListener('click', doSkip);
-    qs('#acl-close').addEventListener('click', function() {
-        qs('#acl-panel').style.display = 'none';
-    });
-    qs('#acl-copy').addEventListener('click', function() {
-        copyToClipboard(accumulated.trim(), function() { setStatus('\u2705 Copied!'); });
-    });
-    qs('#acl-dl').addEventListener('click', function() {
-        downloadFile(accumulated.trim(), 'output.html', 'text/html');
-    });
+	var input = qs('#acl-input');
+	input.addEventListener('keydown', function(e) {
+		if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); toggle(); }
+	});
+	input.addEventListener('input', function() {
+		this.style.height = 'auto';
+		var newH = Math.min(this.scrollHeight, 300);
+		this.style.height = newH + 'px';
+		updateBodyPadding();
+	});
+	qs('#acl-btn').addEventListener('click', toggle);
+	qs('#acl-harvest').addEventListener('click', doHarvest);
+	qs('#acl-skip').addEventListener('click', doSkip);
+	qs('#acl-close').addEventListener('click', function() {
+		qs('#acl-panel').style.display = 'none';
+	});
+	qs('#acl-copy').addEventListener('click', function() {
+		copyToClipboard(accumulated.trim(), function() { setStatus('\u2705 Copied!'); });
+	});
+	qs('#acl-dl').addEventListener('click', function() {
+		downloadFile(accumulated.trim(), 'output.html', 'text/html');
+	});
 
-    if (window.ResizeObserver) {
-        var ro = new ResizeObserver(function() { updateBodyPadding(); });
-        ro.observe(qs('#acl-bar'));
-    }
+	if (window.ResizeObserver) {
+		var ro = new ResizeObserver(function() { updateBodyPadding(); });
+		ro.observe(qs('#acl-bar'));
+	}
+
+	qs('#acl-move').addEventListener('click', toggleDockRight);
 }
 
 function initUI() {
