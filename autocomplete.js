@@ -1582,4 +1582,6 @@ window.acl_debug = {
 
 log('Auto-Coder v13.1 loaded. Run test_auto_continue() in console to test. Use acl_debug for debugging.');
 
+toggleDockRight();
+
 })();
