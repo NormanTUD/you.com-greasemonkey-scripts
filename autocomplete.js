@@ -152,16 +152,44 @@ function getCodeBlocksFromElement(el) {
     return results;
 }
 
-function getLastCodeFromDOM() {
-    var el = getLastAnswerTurnEl();
+function stripLeadingFenceArtifacts(code) {
+    if (!code) return code;
+    var lines = code.split('\n');
+    // Check if first line is just a language identifier (no actual code)
+    if (lines.length > 1) {
+        var firstLine = lines[0].trim().toLowerCase();
+        var langIds = ['javascript', 'js', 'html', 'css', 'python', 'py', 'typescript', 'ts',
+                       'json', 'xml', 'sql', 'bash', 'sh', 'text', 'plaintext', 'plain',
+                       'jsx', 'tsx', 'php', 'ruby', 'java', 'c', 'cpp', 'csharp', 'go',
+                       'rust', 'swift', 'kotlin', 'dart', 'lua', 'perl', 'r', 'scala'];
+        if (langIds.indexOf(firstLine) !== -1) {
+            lines.shift();
+        }
+    }
+    return lines.join('\n');
+}
+
+function getMergedCodeFromTurn(el) {
     if (!el) return '';
     var blocks = getCodeBlocksFromElement(el);
     if (blocks.length === 0) return '';
-    var longest = '';
-    for (var i = 0; i < blocks.length; i++) {
-        if (blocks[i].length > longest.length) longest = blocks[i];
+    if (blocks.length === 1) return blocks[0];
+
+    // Multiple blocks in same turn = Claude used fences despite instructions
+    // Merge them sequentially
+    var merged = blocks[0];
+    for (var i = 1; i < blocks.length; i++) {
+        var cleaned = stripLeadingFenceArtifacts(blocks[i]);
+        merged = mergeOverlap(merged, cleaned);
     }
-    return longest;
+    return merged;
+}
+
+function getLastCodeFromDOM() {
+    var el = getLastAnswerTurnEl();
+    if (!el) return '';
+    // USE NEW MERGED FUNCTION instead of just getting longest block
+    return getMergedCodeFromTurn(el);
 }
 
 function getAllCodeFromAllTurns() {
@@ -431,8 +459,10 @@ function isResponseFullySettled() {
     return true;
 }
 
+
 function getRawTail() {
-    var code = getLastCodeFromDOM();
+    var el = getLastAnswerTurnEl();
+    var code = el ? getMergedCodeFromTurn(el) : '';
     var source = (code && code.trim().length > 0) ? code : accumulated;
     if (!source) return '';
     return getLastNLines(source, OVERLAP_LINES);
@@ -451,6 +481,8 @@ function cleanMarkers(code) {
     for (var i = 0; i < patterns.length; i++) {
         cleaned = cleaned.replace(patterns[i], '');
     }
+    // Also strip any backtick fence lines that leaked through
+    cleaned = stripBacktickFences(cleaned);
     cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
     return cleaned.replace(/^\n+/, '').replace(/\n+$/, '');
 }
@@ -463,9 +495,10 @@ function harvestAllCode() {
     }
     var allCode = '';
     for (var i = 0; i < turns.length; i++) {
-        var blocks = getCodeBlocksFromElement(turns[i]);
-        for (var j = 0; j < blocks.length; j++) {
-            var cleaned = cleanMarkers(blocks[j]);
+        // Use getMergedCodeFromTurn to handle split blocks within a turn
+        var turnCode = getMergedCodeFromTurn(turns[i]);
+        if (turnCode) {
+            var cleaned = cleanMarkers(turnCode);
             if (cleaned.trim().length > 20) {
                 allCode = mergeOverlap(allCode, cleaned);
             }
@@ -688,7 +721,6 @@ function poll() {
                 pollTimeout = setTimeout(poll, STREAM_CHECK_INTERVAL);
                 return;
             }
-            // Exceeded max waits - response truly stopped mid-code-block (truncated)
             log('Fence count odd but response stopped after ' + unclosedFenceWaitCount + ' checks - treating as truncated');
             unclosedFenceWaitCount = 0;
         }
@@ -744,19 +776,38 @@ function handleResponse() {
     }
     lastResponseText = text;
 
-    var newCode = getLastCodeFromDOM();
+    // USE getMergedCodeFromTurn instead of getLastCodeFromDOM for consistency
+    var el = getLastAnswerTurnEl();
+    var newCode = getMergedCodeFromTurn(el);
 
     if (!newCode || newCode.trim().length < 20) {
-        log('No code found in last turn DOM');
+        log('No code found in last turn DOM (or too short)');
     }
 
     if (newCode && newCode.trim().length > 20) {
-        accumulated = mergeOverlap(accumulated, cleanMarkers(newCode));
+        var cleanedNew = cleanMarkers(newCode);
+        // Also strip any backtick fences that might have leaked into the text content
+        cleanedNew = stripBacktickFences(cleanedNew);
+        accumulated = mergeOverlap(accumulated, cleanedNew);
     }
 
     lastRawTail = getRawTail();
-    // FIX: Do NOT call injectCodeBlock here - only show at finish/harvest
     decideNextAction(text);
+}
+
+function stripBacktickFences(code) {
+    if (!code) return code;
+    var lines = code.split('\n');
+    var filtered = [];
+    for (var i = 0; i < lines.length; i++) {
+        var trimmed = lines[i].trim();
+        // Skip lines that are ONLY a fence (``` optionally followed by a language)
+        if (/^`{3,}\s*\w*\s*$/.test(trimmed)) { // `
+            continue;
+        }
+        filtered.push(lines[i]);
+    }
+    return filtered.join('\n');
 }
 
 function decideNextAction(text) {
@@ -1058,11 +1109,24 @@ function mergeOverlap(existing, fragment) {
     if (!fragment) return existing;
     if (fragment.trim().length < 30 && existing.trim().length > 100) return existing;
 
+    // NEW: Strip any fence artifacts from fragment before merging
+    fragment = stripBacktickFences(fragment);
+    fragment = stripLeadingFenceArtifacts(fragment);
+
     var aLines = existing.split('\n');
     var bLines = fragment.split('\n');
 
+    // NEW Step -1: Check if fragment is entirely contained within existing (subset check)
+    // This happens when Claude repeats a large chunk after a fence break
+    if (bLines.length > 5 && bLines.length < aLines.length) {
+        var isSubset = isFragmentSubsetOfExisting(aLines, bLines);
+        if (isSubset) {
+            log('Merge: fragment is a subset of existing, skipping');
+            return existing;
+        }
+    }
+
     // Step 0: Try the truncation-aware overlap detection FIRST
-    // This handles the critical case where A ends mid-line and B repeats context before continuing
     var truncOverlap = findOverlapWithTruncation(aLines, bLines);
     if (truncOverlap) {
         log('Merge: truncation-aware overlap at posA=' + truncOverlap.posA + ' startB=' + truncOverlap.startB);
@@ -1072,10 +1136,10 @@ function mergeOverlap(existing, fragment) {
         return head.join('\n') + '\n' + tail.join('\n');
     }
 
-    // Step 1: Try fixTruncatedTail (simple case: first line of B completes last line of A)
+    // Step 1: Try fixTruncatedTail
     fixTruncatedTail(aLines, bLines);
 
-    // Step 2: Try exact overlap (last N lines of A match first N lines of B)
+    // Step 2: Try exact overlap
     var exact = findExactOverlap(aLines, bLines);
     if (exact > 0) {
         log('Merge: exact overlap of ' + exact + ' lines');
@@ -1084,7 +1148,7 @@ function mergeOverlap(existing, fragment) {
         return aLines.join('\n') + '\n' + remainder.join('\n');
     }
 
-    // Step 3: Try partial overlap (a sequence in B matches a sequence at end of A)
+    // Step 3: Try partial overlap
     var partial = findPartialOverlap(aLines, bLines);
     if (partial) {
         log('Merge: partial overlap at posA=' + partial.posA + ' startB=' + partial.startB + ' truncated=' + partial.truncatedTail);
@@ -1094,14 +1158,23 @@ function mergeOverlap(existing, fragment) {
         return headP.join('\n') + '\n' + tailP.join('\n');
     }
 
-    // Step 4: Mid-line split (last line of A + first line of B form one complete line)
+    // NEW Step 3.5: Try large-window overlap for cases where Claude repeats many lines
+    var largeOverlap = findLargeContextOverlap(aLines, bLines);
+    if (largeOverlap) {
+        log('Merge: large context overlap found, skipB=' + largeOverlap.skipB);
+        var newContent = bLines.slice(largeOverlap.skipB);
+        if (newContent.length === 0) return aLines.join('\n');
+        return aLines.join('\n') + '\n' + newContent.join('\n');
+    }
+
+    // Step 4: Mid-line split
     if (detectMidLineSplit(aLines, bLines)) {
         var firstBIdx = 0;
         while (firstBIdx < bLines.length && bLines[firstBIdx].trim() === '') firstBIdx++;
         var joinedLine = aLines[aLines.length - 1] + bLines[firstBIdx];
         var headLines = aLines.slice(0, aLines.length - 1);
         var tailLines = bLines.slice(firstBIdx + 1);
-        log('Merge: mid-line split detected, joining last line of A with first line of B');
+        log('Merge: mid-line split detected');
         var result = headLines.join('\n');
         if (result.length > 0) result += '\n';
         result += joinedLine;
@@ -1109,50 +1182,156 @@ function mergeOverlap(existing, fragment) {
         return result;
     }
 
-    // Step 5: No overlap found, just concatenate
+    // Step 5: No overlap found, concatenate
     log('Merge: no overlap found, concatenating');
     return aLines.join('\n') + '\n' + bLines.join('\n');
 }
 
+function isFragmentSubsetOfExisting(aLines, bLines) {
+    // Check if the first 5 non-empty lines of B all exist in A in sequence
+    var bStart = 0;
+    while (bStart < bLines.length && bLines[bStart].trim() === '') bStart++;
+
+    var checkLines = [];
+    for (var i = bStart; i < bLines.length && checkLines.length < 5; i++) {
+        if (bLines[i].trim().length > 0) checkLines.push(bLines[i].trim());
+    }
+
+    if (checkLines.length < 3) return false;
+
+    // Find first checkLine in A
+    for (var posA = 0; posA < aLines.length; posA++) {
+        if (aLines[posA].trim() !== checkLines[0]) continue;
+        // Check if subsequent lines also match
+        var allMatch = true;
+        for (var k = 1; k < checkLines.length; k++) {
+            var aIdx = posA + k;
+            // Skip empty lines in A
+            while (aIdx < aLines.length && aLines[aIdx].trim() === '') aIdx++;
+            if (aIdx >= aLines.length || aLines[aIdx].trim() !== checkLines[k]) {
+                allMatch = false;
+                break;
+            }
+        }
+        if (allMatch) {
+            // Now check if ALL of B is within A (not just the first 5 lines)
+            // Check last few lines of B
+            var bEnd = bLines.length - 1;
+            while (bEnd > 0 && bLines[bEnd].trim() === '') bEnd--;
+            var lastBLine = bLines[bEnd].trim();
+            if (lastBLine.length > 0) {
+                for (var searchA = posA; searchA < aLines.length; searchA++) {
+                    if (aLines[searchA].trim() === lastBLine) return true;
+                }
+            }
+            // If we matched the start but not the end, it's not a full subset
+            // but it IS an overlap - return false and let normal overlap handle it
+            return false;
+        }
+    }
+    return false;
+}
+
+function findLargeContextOverlap(aLines, bLines) {
+    // Look for the first non-empty line of B somewhere in the last 60 lines of A
+    var bStart = 0;
+    while (bStart < bLines.length && bLines[bStart].trim() === '') bStart++;
+    if (bStart >= bLines.length) return null;
+
+    var searchStart = Math.max(0, aLines.length - 60);
+    var firstBTrimmed = bLines[bStart].trim();
+    if (firstBTrimmed.length < 5) return null; // Too short to be reliable
+
+    for (var posA = searchStart; posA < aLines.length; posA++) {
+        if (aLines[posA].trim() !== firstBTrimmed) continue;
+
+        // Count consecutive matching lines
+        var matchCount = 1;
+        var aIdx = posA + 1;
+        var bIdx = bStart + 1;
+        while (aIdx < aLines.length && bIdx < bLines.length) {
+            if (aLines[aIdx].trim() === bLines[bIdx].trim()) {
+                matchCount++;
+                aIdx++;
+                bIdx++;
+            } else if (bLines[bIdx].trim() === '') {
+                bIdx++; // Skip empty lines in B
+            } else if (aLines[aIdx].trim() === '') {
+                aIdx++; // Skip empty lines in A
+            } else {
+                break;
+            }
+        }
+
+        // If we matched at least 5 lines and reached the end of A's content
+        // (or close to it), this is a large context overlap
+        if (matchCount >= 5) {
+            // bIdx now points to where new content starts in B
+            // But only if we consumed most of the remaining A
+            var aRemaining = aLines.length - aIdx;
+            if (aRemaining <= 2 || aIdx >= aLines.length - 1) {
+                return { skipB: bIdx };
+            }
+            // If we matched a lot but didn't reach end of A,
+            // it might be a partial overlap in the middle - still useful
+            if (matchCount >= 10) {
+                return { skipB: bIdx };
+            }
+        }
+    }
+    return null;
+}
+
+
+
+// ============================================================
+// PROMPT BUILDING - COMPLETELY REDESIGNED
+// The key insight: remove ALL backtick characters from the prompt itself,
+// use a different delimiter for the overlap context, and restructure
+// instructions to be short, positive, and front-loaded.
+// ============================================================
+
 function buildContinuePrompt() {
     var tail = lastRawTail || getLastNLines(accumulated, OVERLAP_LINES);
+    // Use a delimiter that won't prime Claude to output backticks
+    var DELIM = '-----CODE-CONTEXT-BELOW-----';
+    var DELIM_END = '-----CODE-CONTEXT-ABOVE-----';
     return [
-        'Continue EXACTLY where you left off. Repeat the last 3-4 lines from below for merge overlap, then continue with new code.',
-        '', FENCE, tail, FENCE, '',
-
-	"=== CRITICAL CONTINUATION RULES ===",
-	"1. You are CONTINUING code that is already inside an open code block from a previous message.",
-	"2. Do NOT output the triple-backtick character sequence ANYWHERE in your response. Not at the start, not at the end, not anywhere in between. Zero instances.",
-	"3. Do NOT wrap your output in a code block or code fence of any kind.",
-	"4. Just write raw code lines directly as plain text. No markdown formatting whatsoever.",
-	"5. The user's system will automatically merge your raw lines into the existing open code block.",
-	"6. If you write triple-backticks you will BREAK the merge system and corrupt the output into multiple code blocks.",
-	"7. Start your response with the last 3-4 lines shown above (the overlap), then continue writing new code seamlessly.",
-	"8. Do NOT use the backtick character (U+0060) anywhere in your output — not in template literals, not in comments, not in strings, not for inline code formatting. Use String.fromCharCode(96) or regular quotes instead.",
-	"9. Your response must look like a plain text file with code lines. Imagine you are appending to a file. No fences, no formatting markers.",
-	"10. When you are 100% finished with the ENTIRE file, write AUTOCODER_FINISHED on its own line as the very last thing.",
-	"11. If you are NOT done yet, just stop mid-code. Do NOT write any closing marker or summary text.",
-	"12. Do NOT add any explanatory text, comments about what you're doing, or markdown outside the code. ONLY raw code lines.",
-	"13. Overlap roughly 3-4 lines at the start so the merge algorithm can align properly.",
-	"14. THINK about this: your raw text output will be concatenated directly into an existing code block. Any ``` sequence will terminate that block prematurely and start a new one, splitting the file. This MUST NOT happen.",
-	"15. If you need to represent the backtick character in a string, use String.fromCharCode(96). If you need multi-line strings, use array joins or string concatenation with regular quotes.",
-	"===================================",
-        'These rules are non-negotiable.'
+        'IMPORTANT: You are writing RAW CODE as plain text. No markdown. No formatting. No code fences.',
+        '',
+        'Your output will be directly appended to an existing file. Write ONLY code lines.',
+        '',
+        'Here is where the code left off:',
+        DELIM,
+        tail,
+        DELIM_END,
+        '',
+        'INSTRUCTIONS:',
+        '1. Start by repeating the last 3-4 lines shown above (for alignment), then continue with new code.',
+        '2. Write plain text only. Your entire response must be raw code lines, nothing else.',
+        '3. FORBIDDEN characters: the grave accent character (Unicode U+0060) must NEVER appear in your output. Not alone, not tripled, not anywhere. Use String.fromCharCode(96) for that character in code. Use regular quotes for strings.',
+        '4. FORBIDDEN patterns: Do not write any line that starts with three or more grave accents. Do not write markdown of any kind.',
+        '5. For template literals, use String.fromCharCode(96) or string concatenation with regular quotes.',
+        '6. When the ENTIRE file is complete, write AUTOCODER_FINISHED on its own line at the very end.',
+        '7. If not finished, just stop. Do not add commentary or closing markers.',
+        '',
+        'Think of yourself as a text file editor appending lines. BEGIN RAW CODE NOW:'
     ].join('\n');
 }
 
 function buildInitialPrompt(userText) {
+    var BT_WORD = 'grave-accent-character (the one on the tilde key)';
     return [
         userText, '',
-        '=== RULES ===',
-        '1. Write the complete code in a SINGLE code block (open with ' + FENCE + ' at the start, close with ' + FENCE + ' at the end).',
-        '2. Use only ONE code block for the entire file. Do NOT use multiple code blocks.',
-        '3. Do NOT use the backtick character (`) anywhere INSIDE the code itself \u2014 not in template literals, not in comments, not in strings. Use String.fromCharCode(96) or regular quotes instead.',
-        '4. If you run out of space, just stop mid-code WITHOUT closing the code block. Do NOT write a closing ' + FENCE + '. I will ask you to continue.',
-        '5. When continuing in follow-up messages, you will NOT use ' + FENCE + ' at all \u2014 just raw code lines.',
-        '6. When you are 100% completely finished with the ENTIRE file, close the code block and write AUTOCODER_FINISHED on its own line after it.',
-        '7. Do NOT write AUTOCODER_FINISHED unless the code is truly 100% complete.',
-        '============='
+        '=== OUTPUT RULES ===',
+        '1. Write the complete code in a SINGLE fenced code block. Open it at the start, close it at the end.',
+        '2. Use only ONE code block for the entire file.',
+        '3. CRITICAL: Inside the code itself, NEVER use the ' + BT_WORD + '. Not in template literals, not in comments, not in strings. Use String.fromCharCode(96) or regular quotes instead.',
+        '4. If you run out of space, just stop mid-code. Do NOT close the code block. Do NOT add any text after the code. I will ask you to continue.',
+        '5. When continuing later, you will write ONLY raw code lines with NO markdown formatting whatsoever.',
+        '6. When 100% finished with the ENTIRE file, close the code block and write AUTOCODER_FINISHED on its own line.',
+        '7. Do NOT write AUTOCODER_FINISHED unless truly 100% complete.',
+        '==============='
     ].join('\n');
 }
 
@@ -1175,7 +1354,11 @@ function finish() {
         accumulated = code;
     }
 
-    // FIX: Only show merged output at the very end
+    // Final cleanup pass - strip any remaining fence artifacts
+    code = stripBacktickFences(code);
+    code = cleanMarkers(code);
+    accumulated = code;
+
     showMergedOutput = true;
     if (isValidHarvest(code)) {
         injectCodeBlock(code);
@@ -1189,31 +1372,30 @@ function finish() {
 }
 
 function start(prompt) {
-	running = true;
-	continues = 0;
-	accumulated = '';
-	lastRawTail = '';
-	prevHadUnclosedBlock = false;
-	lastHarvestedText = '';
-	showMergedOutput = false; // FIX: Reset - don't show until finish
-	lastTurns = getTurnCount();
-	lastSeenTextLength = 0;
-	stableCheckCount = 0;
-	lastResponseText = '';
-	unclosedFenceWaitCount = 0;
-	isProcessingResponse = false;
-	if (responseHandleTimeout) { clearTimeout(responseHandleTimeout); responseHandleTimeout = null; }
-	if (pollTimeout) { clearTimeout(pollTimeout); pollTimeout = null; }
+    running = true;
+    continues = 0;
+    accumulated = '';
+    lastRawTail = '';
+    prevHadUnclosedBlock = false;
+    lastHarvestedText = '';
+    showMergedOutput = false;
+    lastTurns = getTurnCount();
+    lastSeenTextLength = 0;
+    stableCheckCount = 0;
+    lastResponseText = '';
+    unclosedFenceWaitCount = 0;
+    isProcessingResponse = false;
+    if (responseHandleTimeout) { clearTimeout(responseHandleTimeout); responseHandleTimeout = null; }
+    if (pollTimeout) { clearTimeout(pollTimeout); pollTimeout = null; }
 
-	// Remove old injected block if any
-	var oldBlock = document.getElementById('acl-injected-block');
-	if (oldBlock) oldBlock.remove();
+    var oldBlock = document.getElementById('acl-injected-block');
+    if (oldBlock) oldBlock.remove();
 
-	incrementProcessing();
-	updateBtn();
-	setStatus('\u23F3 Submitting...');
-	submit(buildInitialPrompt(prompt));
-	pollTimeout = setTimeout(poll, INITIAL_POLL_DELAY);
+    incrementProcessing();
+    updateBtn();
+    setStatus('\u23F3 Submitting...');
+    submit(buildInitialPrompt(prompt));
+    pollTimeout = setTimeout(poll, INITIAL_POLL_DELAY);
 }
 
 function stop() {
