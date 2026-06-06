@@ -1119,20 +1119,25 @@ function buildContinuePrompt() {
     return [
         'Continue EXACTLY where you left off. Repeat the last 3-4 lines from below for merge overlap, then continue with new code.',
         '', FENCE, tail, FENCE, '',
-        '=== CRITICAL CONTINUATION RULES ===',
-        '1. You are CONTINUING code that is already inside an open code block from a previous message.',
-        '2. Do NOT output ' + FENCE + ' at all. Not at the start, not at the end, not anywhere.',
-        '3. Do NOT wrap your output in a code block. Just write raw code lines directly.',
-        '4. The user\u2019s system will automatically merge your raw lines into the existing code block.',
-        '5. If you write ' + FENCE + ' you will BREAK the merge system and corrupt the output.',
-        '6. Start your response with the last 3 lines shown above (the overlap), then continue writing new code.',
-        '7. Do NOT use the backtick character (`) anywhere in your output \u2014 not in template literals, comments, or strings. Use String.fromCharCode(96) or regular quotes instead.',
-        '8. When you are 100% finished with the ENTIRE file, write AUTOCODER_FINISHED on its own line as the very last thing.',
-        '9. If you are NOT done, just stop mid-code. Do NOT write any closing marker.',
-        '10. Overlap roughly 3-4 lines at the start so the merge algorithm can align properly.',
-        '===================================',
-        '',
-        'REMEMBER: NO ' + FENCE + ' IN YOUR RESPONSE. Just raw code lines. This is non-negotiable.'
+
+	"=== CRITICAL CONTINUATION RULES ===",
+	"1. You are CONTINUING code that is already inside an open code block from a previous message.",
+	"2. Do NOT output the triple-backtick character sequence ANYWHERE in your response. Not at the start, not at the end, not anywhere in between. Zero instances.",
+	"3. Do NOT wrap your output in a code block or code fence of any kind.",
+	"4. Just write raw code lines directly as plain text. No markdown formatting whatsoever.",
+	"5. The user's system will automatically merge your raw lines into the existing open code block.",
+	"6. If you write triple-backticks you will BREAK the merge system and corrupt the output into multiple code blocks.",
+	"7. Start your response with the last 3-4 lines shown above (the overlap), then continue writing new code seamlessly.",
+	"8. Do NOT use the backtick character (U+0060) anywhere in your output — not in template literals, not in comments, not in strings, not for inline code formatting. Use String.fromCharCode(96) or regular quotes instead.",
+	"9. Your response must look like a plain text file with code lines. Imagine you are appending to a file. No fences, no formatting markers.",
+	"10. When you are 100% finished with the ENTIRE file, write AUTOCODER_FINISHED on its own line as the very last thing.",
+	"11. If you are NOT done yet, just stop mid-code. Do NOT write any closing marker or summary text.",
+	"12. Do NOT add any explanatory text, comments about what you're doing, or markdown outside the code. ONLY raw code lines.",
+	"13. Overlap roughly 3-4 lines at the start so the merge algorithm can align properly.",
+	"14. THINK about this: your raw text output will be concatenated directly into an existing code block. Any ``` sequence will terminate that block prematurely and start a new one, splitting the file. This MUST NOT happen.",
+	"15. If you need to represent the backtick character in a string, use String.fromCharCode(96). If you need multi-line strings, use array joins or string concatenation with regular quotes.",
+	"===================================",
+        'These rules are non-negotiable.'
     ].join('\n');
 }
 
