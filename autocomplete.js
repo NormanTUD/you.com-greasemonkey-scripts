@@ -1116,20 +1116,23 @@ function mergeOverlap(existing, fragment) {
 
 function buildContinuePrompt() {
     var tail = lastRawTail || getLastNLines(accumulated, OVERLAP_LINES);
-    var noFenceWarning = 'IMPORTANT: Do NOT start your response with ' + FENCE + ' or any code fence. You are continuing MID-CODE inside an already-open code block. Just write the next lines of code directly.';
     return [
-        'Continue EXACTLY where you left off. You MUST repeat the last 3-4 lines from below so I can merge properly:',
+        'Continue EXACTLY where you left off. Repeat the last 3-4 lines from below for merge overlap, then continue with new code.',
         '', FENCE, tail, FENCE, '',
-        noFenceWarning,
+        '=== CRITICAL CONTINUATION RULES ===',
+        '1. You are CONTINUING code that is already inside an open code block from a previous message.',
+        '2. Do NOT output ' + FENCE + ' at all. Not at the start, not at the end, not anywhere.',
+        '3. Do NOT wrap your output in a code block. Just write raw code lines directly.',
+        '4. The user\u2019s system will automatically merge your raw lines into the existing code block.',
+        '5. If you write ' + FENCE + ' you will BREAK the merge system and corrupt the output.',
+        '6. Start your response with the last 3 lines shown above (the overlap), then continue writing new code.',
+        '7. Do NOT use the backtick character (`) anywhere in your output \u2014 not in template literals, comments, or strings. Use String.fromCharCode(96) or regular quotes instead.',
+        '8. When you are 100% finished with the ENTIRE file, write AUTOCODER_FINISHED on its own line as the very last thing.',
+        '9. If you are NOT done, just stop mid-code. Do NOT write any closing marker.',
+        '10. Overlap roughly 3-4 lines at the start so the merge algorithm can align properly.',
+        '===================================',
         '',
-        'CRITICAL: Start by repeating at least the last 3 lines shown above, then continue with new code after them. This overlap is required for proper merging.',
-        'When you are 100% completely done with the ENTIRE file, write AUTOCODER_FINISHED after your code block on its own line.',
-        '',
-        'If you are NOT done yet, just stop mid-code. I will ask you to continue.',
-        "Make sure you start code blocks with 3 backticks again, so it works. And make also sure you do not write backticks inside of them to not leave the code.",
-	"Write the ENTIRE file in ONE single code block. Do NOT split it across messages. If you cannot fit it all, stop mid-code WITHOUT closing the block — I will ask you to continue. When continuing, do NOT use triple backticks at all — just write raw code lines. Never use backtick characters (`) anywhere inside the code itself (not in template literals, not in comments, nowhere).",
-	"When continueing, make sure you overlap roughly 10 lines.",
-        'Do NOT write AUTOCODER_FINISHED unless the code is truly 100% complete.'
+        'REMEMBER: NO ' + FENCE + ' IN YOUR RESPONSE. Just raw code lines. This is non-negotiable.'
     ].join('\n');
 }
 
@@ -1137,14 +1140,13 @@ function buildInitialPrompt(userText) {
     return [
         userText, '',
         '=== RULES ===',
-        'Write the complete code in a single code block.',
-        'If you run out of space, just stop mid-code. I will ask you to continue.',
-        'When you are 100% completely finished with the ENTIRE file, write AUTOCODER_FINISHED after your code block on its own line.',
-        '',
-        'Do NOT write AUTOCODER_FINISHED unless the code is truly 100% complete.',
-        "Make sure you start code blocks with 3 backticks again, so it works. And make also sure you do not write backticks inside of them to not leave the code.",
-	"Write the ENTIRE file in ONE single code block. Do NOT split it across messages. If you cannot fit it all, stop mid-code WITHOUT closing the block — I will ask you to continue. When continuing, do NOT use triple backticks at all — just write raw code lines. Never use backtick characters (`) anywhere inside the code itself (not in template literals, not in comments, nowhere).",
-	"When continueing, make sure you overlap roughly 10 lines.",
+        '1. Write the complete code in a SINGLE code block (open with ' + FENCE + ' at the start, close with ' + FENCE + ' at the end).',
+        '2. Use only ONE code block for the entire file. Do NOT use multiple code blocks.',
+        '3. Do NOT use the backtick character (`) anywhere INSIDE the code itself \u2014 not in template literals, not in comments, not in strings. Use String.fromCharCode(96) or regular quotes instead.',
+        '4. If you run out of space, just stop mid-code WITHOUT closing the code block. Do NOT write a closing ' + FENCE + '. I will ask you to continue.',
+        '5. When continuing in follow-up messages, you will NOT use ' + FENCE + ' at all \u2014 just raw code lines.',
+        '6. When you are 100% completely finished with the ENTIRE file, close the code block and write AUTOCODER_FINISHED on its own line after it.',
+        '7. Do NOT write AUTOCODER_FINISHED unless the code is truly 100% complete.',
         '============='
     ].join('\n');
 }
