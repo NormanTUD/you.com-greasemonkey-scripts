@@ -471,8 +471,6 @@ function getRawTail() {
 function cleanMarkers(code) {
     var patterns = [
         /^.*AUTOCODER_FINISHED.*$/gm,
-        /^.*>>>CODE STARTS<<<.*$/gm,
-        /^.*>>>CODE ENDS<<<.*$/gm,
         /^.*>>>FINISHED<<<.*$/gm
     ];
     var cleaned = code;
