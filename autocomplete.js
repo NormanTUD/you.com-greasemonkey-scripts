@@ -1312,8 +1312,6 @@ function buildContinuePrompt() {
         '- FORBIDDEN patterns: Do not write any line that starts with three or more grave accents. Do not write markdown of any kind.',
         '- For template literals, use String.fromCharCode(96) or string concatenation with regular quotes.',
         '- When the ENTIRE file is complete, write AUTOCODER_FINISHED on its own line at the very end.',
-        '',
-        'Think of yourself as a text file editor appending lines. BEGIN RAW CODE NOW:'
     ].join('\n');
 }
 
