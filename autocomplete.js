@@ -1309,7 +1309,6 @@ function buildContinuePrompt() {
         'INSTRUCTIONS:',
         '- Start by repeating the last 3-4 lines shown above (for alignment), then continue with new code.',
         '- FORBIDDEN patterns: Do not write any line that starts with three or more grave accents.',
-        '- For template literals, use String.fromCharCode(96) or string concatenation with regular quotes.',
         '- When the ENTIRE file is complete, write AUTOCODER_FINISHED on its own line at the very end.',
     ].join('\n');
 }
@@ -1321,7 +1320,7 @@ function buildInitialPrompt(userText) {
         '=== OUTPUT RULES ===',
         '- Write the complete code in a SINGLE fenced code block. Open it at the start, close it at the end.',
         '- Use only ONE code block for the entire file.',
-        '- CRITICAL: Inside the code itself, NEVER use the ' + BT_WORD + '. Not in template literals, not in comments, not in strings. Use String.fromCharCode(96) or regular quotes instead.',
+        '- CRITICAL: Inside the code itself, NEVER use the ' + BT_WORD + '. Not in template literals, not in comments, not in strings. Use regular quotes instead.',
         '- When 100% finished with the ENTIRE file, close the code block and write AUTOCODER_FINISHED on its own line.',
         '- Do NOT write AUTOCODER_FINISHED unless truly 100% complete.',
         '==============='
