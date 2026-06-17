@@ -1307,13 +1307,12 @@ function buildContinuePrompt() {
 }
 
 function buildInitialPrompt(userText) {
-    return [
-        userText, '',
-        '=== OUTPUT RULES ===',
-        '- When 100% finished with the ENTIRE file, close the code block and write AUTOCODER_FINISHED on its own line.',
-        '- Do NOT write AUTOCODER_FINISHED unless truly 100% complete.',
-        '==============='
-    ].join('\n');
+	return [
+		userText, '',
+		'- When 100% finished with the ENTIRE file, close the code block and write AUTOCODER_FINISHED on its own line.',
+		"- Output the ENTIRE file in ONE single continuous code block. Do NOT close and reopen the code block at any point.",
+		'- Do NOT write AUTOCODER_FINISHED unless truly 100% complete.',
+	].join('\n');
 }
 
 // ============================================================
