@@ -1315,7 +1315,7 @@ function buildInitialPrompt(userText) {
         userText, '',
         '=== OUTPUT RULES ===',
         '- Write the complete code in a SINGLE fenced code block. Open it at the start, close it at the end.',
-        '- CRITICAL: Inside the code itself, NEVER use the ' + BT_WORD + '. Not in template literals, not in comments, not in strings. Use regular quotes instead.',
+        '- CRITICAL: Inside the code itself, NEVER use the backtick character outside of the code block markers. Not in template literals, not in comments, not in strings. Use regular quotes instead.',
         '- When 100% finished with the ENTIRE file, close the code block and write AUTOCODER_FINISHED on its own line.',
         '- Do NOT write AUTOCODER_FINISHED unless truly 100% complete.',
         '==============='
