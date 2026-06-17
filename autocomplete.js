@@ -1288,29 +1288,35 @@ function findLargeContextOverlap(aLines, bLines) {
 // ============================================================
 
 function buildContinuePrompt() {
-    var tail = lastRawTail || getLastNLines(accumulated, OVERLAP_LINES);
-    // Use a delimiter that won't prime Claude to output backticks
-    var DELIM = '```';
-    var DELIM_END = '```';
-    return [
-        'Your output will be directly appended to an existing file. Write ONLY code lines.',
-        '',
-        'Here is where the code left off:',
-        DELIM,
-        tail,
-        DELIM_END,
-        '',
-        'INSTRUCTIONS:',
-        '- Start by repeating the last 4-6 lines shown above exactly as they are (for alignment), then continue with new code.',
-        '- When the ENTIRE file is complete, write AUTOCODER_FINISHED on its own line at the very end.',
-    ].join('\n');
+	var tail = lastRawTail || getLastNLines(accumulated, OVERLAP_LINES);
+	// Use a delimiter that won't prime Claude to output backticks
+	var DELIM = '```';
+	var DELIM_END = '```';
+	return [
+		'Your output will be directly appended to an existing file. Write ONLY code lines.',
+		'',
+		'RULES: Single continuous block. No markdown breaks. No commentary.',
+		'Here is where the code left off:',
+		DELIM,
+		tail,
+		DELIM_END,
+		'',
+		'IMPORTANT RULES:',
+		'- Start by repeating the last 4-6 lines shown above exactly as they are (for alignment), then continue with new code.',
+		'- When the ENTIRE file is complete, write AUTOCODER_FINISHED on its own line at the very end.',
+		"- Do not output any markdown formatting, commentary, or explanation between code lines. Only raw code from start to finish.",
+		"- Output the ENTIRE file in ONE single continuous code block. Do NOT close and reopen the code block at any point.",
+		"- Do NOT accidentally output triple backticks within the code. If your code contains template literals, escape them." ,
+		"- Before you write any code, repeat back the OUTPUT RULES verbatim. Then begin the code. Write it in the 'I'-form, so you know its YOU that has to follow these rules stated here.",
+		"REMINDER: Single continuous block. No markdown breaks. No commentary.",
+		"Continue now:"
+	].join('\n');
 }
 
 function buildInitialPrompt(userText) {
 	return [
 		userText, '',
-		'- When 100% finished with the ENTIRE file, close the code block and write AUTOCODER_FINISHED on its own line.',
-		"- Output the ENTIRE file in ONE single continuous code block. Do NOT close and reopen the code block at any point.",
+		'- When 100% finished with the ENTIRE file, close the code blocks and write AUTOCODER_FINISHED on its own line.',
 		'- Do NOT write AUTOCODER_FINISHED unless truly 100% complete.',
 	].join('\n');
 }
