@@ -1304,13 +1304,12 @@ function buildContinuePrompt() {
         '',
         'INSTRUCTIONS:',
         '- Start by repeating the last 4-6 lines shown above exactly as they are (for alignment), then continue with new code.',
-        '- FORBIDDEN patterns: Do not write any line that starts with three or more grave accents.',
+        '- FORBIDDEN patterns: Do not write any line that starts with backticks',
         '- When the ENTIRE file is complete, write AUTOCODER_FINISHED on its own line at the very end.',
     ].join('\n');
 }
 
 function buildInitialPrompt(userText) {
-    var BT_WORD = 'grave-accent-character (the one on the tilde key)';
     return [
         userText, '',
         '=== OUTPUT RULES ===',
