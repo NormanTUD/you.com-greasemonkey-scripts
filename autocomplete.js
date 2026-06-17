@@ -1304,7 +1304,6 @@ function buildContinuePrompt() {
         '',
         'INSTRUCTIONS:',
         '- Start by repeating the last 4-6 lines shown above exactly as they are (for alignment), then continue with new code.',
-        '- FORBIDDEN patterns: Do not write any line that starts with backticks',
         '- When the ENTIRE file is complete, write AUTOCODER_FINISHED on its own line at the very end.',
     ].join('\n');
 }
@@ -1314,7 +1313,6 @@ function buildInitialPrompt(userText) {
         userText, '',
         '=== OUTPUT RULES ===',
         '- Write the complete code in a SINGLE code block.',
-        '- CRITICAL: Inside the code itself, NEVER use backticks. Use regular quotes instead.',
         '- When 100% finished with the ENTIRE file, close the code block and write AUTOCODER_FINISHED on its own line.',
         '- Do NOT write AUTOCODER_FINISHED unless truly 100% complete.',
         '==============='
