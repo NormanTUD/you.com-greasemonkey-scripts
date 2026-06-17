@@ -1308,12 +1308,10 @@ function buildContinuePrompt() {
         '',
         'INSTRUCTIONS:',
         '- Start by repeating the last 3-4 lines shown above (for alignment), then continue with new code.',
-        '- Write plain text only. Your entire response must be raw code lines, nothing else.',
         '- FORBIDDEN characters: the grave accent character (Unicode U+0060) must NEVER appear in your output. Not alone, not tripled, not anywhere. Use String.fromCharCode(96) for that character in code. Use regular quotes for strings.',
         '- FORBIDDEN patterns: Do not write any line that starts with three or more grave accents. Do not write markdown of any kind.',
         '- For template literals, use String.fromCharCode(96) or string concatenation with regular quotes.',
         '- When the ENTIRE file is complete, write AUTOCODER_FINISHED on its own line at the very end.',
-        '- If not finished, just stop. Do not add commentary or closing markers.',
         '',
         'Think of yourself as a text file editor appending lines. BEGIN RAW CODE NOW:'
     ].join('\n');
@@ -1327,8 +1325,6 @@ function buildInitialPrompt(userText) {
         '- Write the complete code in a SINGLE fenced code block. Open it at the start, close it at the end.',
         '- Use only ONE code block for the entire file.',
         '- CRITICAL: Inside the code itself, NEVER use the ' + BT_WORD + '. Not in template literals, not in comments, not in strings. Use String.fromCharCode(96) or regular quotes instead.',
-        '- If you run out of space, just stop mid-code. Do NOT close the code block. Do NOT add any text after the code. I will ask you to continue.',
-        '- When continuing later, you will write ONLY raw code lines with NO markdown formatting whatsoever.',
         '- When 100% finished with the ENTIRE file, close the code block and write AUTOCODER_FINISHED on its own line.',
         '- Do NOT write AUTOCODER_FINISHED unless truly 100% complete.',
         '==============='
