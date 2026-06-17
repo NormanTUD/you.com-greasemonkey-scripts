@@ -1294,8 +1294,8 @@ function findLargeContextOverlap(aLines, bLines) {
 function buildContinuePrompt() {
     var tail = lastRawTail || getLastNLines(accumulated, OVERLAP_LINES);
     // Use a delimiter that won't prime Claude to output backticks
-    var DELIM = '-----CODE-CONTEXT-BELOW-----';
-    var DELIM_END = '-----CODE-CONTEXT-ABOVE-----';
+    var DELIM = '```';
+    var DELIM_END = '```';
     return [
         'IMPORTANT: You are writing RAW CODE as plain text. No markdown. No formatting. No code fences.',
         '',
@@ -1308,8 +1308,7 @@ function buildContinuePrompt() {
         '',
         'INSTRUCTIONS:',
         '- Start by repeating the last 3-4 lines shown above (for alignment), then continue with new code.',
-        '- FORBIDDEN characters: the grave accent character (Unicode U+0060) must NEVER appear in your output. Not alone, not tripled, not anywhere. Use String.fromCharCode(96) for that character in code. Use regular quotes for strings.',
-        '- FORBIDDEN patterns: Do not write any line that starts with three or more grave accents. Do not write markdown of any kind.',
+        '- FORBIDDEN patterns: Do not write any line that starts with three or more grave accents.',
         '- For template literals, use String.fromCharCode(96) or string concatenation with regular quotes.',
         '- When the ENTIRE file is complete, write AUTOCODER_FINISHED on its own line at the very end.',
     ].join('\n');
