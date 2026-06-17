@@ -1293,8 +1293,6 @@ function buildContinuePrompt() {
     var DELIM = '```';
     var DELIM_END = '```';
     return [
-        'IMPORTANT: You are writing RAW CODE as plain text. No markdown. No formatting. No code fences.',
-        '',
         'Your output will be directly appended to an existing file. Write ONLY code lines.',
         '',
         'Here is where the code left off:',
