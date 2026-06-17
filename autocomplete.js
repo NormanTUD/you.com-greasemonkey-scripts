@@ -470,8 +470,6 @@ function getRawTail() {
 
 function cleanMarkers(code) {
     var patterns = [
-        /^.*!!!!!CODEBLOCK_STARTS!!!!!.*$/gm,
-        /^.*!!!!!CODEBLOCK_ENDS!!!!!.*$/gm,
         /^.*AUTOCODER_FINISHED.*$/gm,
         /^.*>>>CODE STARTS<<<.*$/gm,
         /^.*>>>CODE ENDS<<<.*$/gm,
