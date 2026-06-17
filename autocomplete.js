@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Auto-Coder v13
+// @name         Auto-Coder v13.2
 // @namespace    http://tampermonkey.net/
-// @version      13.1
+// @version      13.2
 // @description  Auto-continue with robust completion detection, overlap merging, harvest. FIXED: Continue prompt warns about backticks. FIXED: Merged output only shows at end.
 // @match        https://you.com/*
 // @grant        none
