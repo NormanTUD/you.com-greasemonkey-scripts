@@ -1324,13 +1324,13 @@ function buildInitialPrompt(userText) {
     return [
         userText, '',
         '=== OUTPUT RULES ===',
-        '1. Write the complete code in a SINGLE fenced code block. Open it at the start, close it at the end.',
-        '2. Use only ONE code block for the entire file.',
-        '3. CRITICAL: Inside the code itself, NEVER use the ' + BT_WORD + '. Not in template literals, not in comments, not in strings. Use String.fromCharCode(96) or regular quotes instead.',
-        '4. If you run out of space, just stop mid-code. Do NOT close the code block. Do NOT add any text after the code. I will ask you to continue.',
-        '5. When continuing later, you will write ONLY raw code lines with NO markdown formatting whatsoever.',
-        '6. When 100% finished with the ENTIRE file, close the code block and write AUTOCODER_FINISHED on its own line.',
-        '7. Do NOT write AUTOCODER_FINISHED unless truly 100% complete.',
+        '- Write the complete code in a SINGLE fenced code block. Open it at the start, close it at the end.',
+        '- Use only ONE code block for the entire file.',
+        '- CRITICAL: Inside the code itself, NEVER use the ' + BT_WORD + '. Not in template literals, not in comments, not in strings. Use String.fromCharCode(96) or regular quotes instead.',
+        '- If you run out of space, just stop mid-code. Do NOT close the code block. Do NOT add any text after the code. I will ask you to continue.',
+        '- When continuing later, you will write ONLY raw code lines with NO markdown formatting whatsoever.',
+        '- When 100% finished with the ENTIRE file, close the code block and write AUTOCODER_FINISHED on its own line.',
+        '- Do NOT write AUTOCODER_FINISHED unless truly 100% complete.',
         '==============='
     ].join('\n');
 }
