@@ -1301,6 +1301,7 @@ function buildContinuePrompt() {
 		'IMPORTANT RULES:',
 		'- Start by repeating the last 4-6 lines shown above exactly as they are (for alignment), then continue with new code.',
 		'- When the ENTIRE file is complete, write AUTOCODER_FINISHED on its own line at the very end.',
+		'- State these rules yourself, state them in the I-form before you start writing code.'
 	].join('\n');
 }
 
